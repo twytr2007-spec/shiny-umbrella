@@ -1,0 +1,8 @@
+Python.xcframework/
+pysupport/
+py.tar.gz
+build/
+build.log
+Payload/
+*.ipa
+*.xcodeproj/
