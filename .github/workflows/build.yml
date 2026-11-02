@@ -71,9 +71,19 @@ jobs:
           LIBSRC=$(dirname "$LIBDYN")
           PYVER=$(basename "$LIBSRC")
           echo "Python stdlib: $LIBSRC ($PYVER)"
-          mkdir -p "$APP/python/lib" "$APP/Frameworks"
-          cp -R "$LIBSRC" "$APP/python/lib/"
           DEST="$APP/python/lib/$PYVER"
+          mkdir -p "$DEST" "$APP/Frameworks"
+          for d in $(find Python.xcframework -type d -name "$PYVER" -not -path "*simulator*"); do
+            if [ -d "$d/encodings" ] || [ -d "$d/lib-dynload" ]; then
+              echo "Merging $d"
+              cp -R "$d/." "$DEST/"
+            fi
+          done
+          if [ ! -d "$DEST/encodings" ]; then
+            echo "stdlib (encodings) not found. Tree:"
+            find Python.xcframework -maxdepth 5 | head -n 80
+            exit 1
+          fi
           rm -rf "$DEST/test" "$DEST/idlelib" "$DEST/turtledemo" "$DEST/ensurepip" "$DEST/tkinter" "$DEST"/config-*
           find "$DEST" -name "__pycache__" -type d -prune -exec rm -rf {} + || true
           find "$DEST" -type d -name "tests" -prune -exec rm -rf {} + || true
