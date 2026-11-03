@@ -14,10 +14,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Apply update (first run only)
+      - name: Apply fix (first run only)
         run: |
-          if [ ! -f .update-packages-v1 ]; then
-          echo "Applying package-support update"
+          if [ ! -f .update-fix-v2 ]; then
+          echo "Applying Python startup fix"
           cat > Sources/Terminal.swift <<'CODEIDE_UPD_0'
           import Foundation
           import JavaScriptCore
@@ -281,7 +281,7 @@ jobs:
                   let exe = Bundle.main.executablePath ?? (bundle + "/CodeIDE")
                   var errBuf = [CChar](repeating: 0, count: 1024)
                   let cap = Int32(errBuf.count)
-                  let rc = ide_py_init(bundle + "/python", exe, libdir, PythonEngine.bootstrap(),
+                  let rc = ide_py_init(bundle + "/python", exe, libdir, PythonEngine.bootstrap(stdlib: libdir),
                                        pyOutCallback, pyInCallback, &errBuf, cap)
                   if rc != 0 {
                       failure = "Python failed to start (code \(rc)): " + String(cString: errBuf)
@@ -295,7 +295,7 @@ jobs:
               func repl(_ line: String) { ide_py_repl(line) }
               func interrupt() { ide_py_interrupt() }
 
-              static func bootstrap() -> String {
+              static func bootstrap(stdlib: String) -> String {
                   let projects = ProjectStore.directory.path
                   let site = PackageManager.sitePackages.path
                   return #"""
@@ -311,7 +311,7 @@ jobs:
           if PROJECTS not in sys.path:
               sys.path.insert(0, PROJECTS)
           SITE = r"\#(site)"
-          for _p in (SITE, os.path.join(os.path.dirname(os.__file__), "site-packages")):
+          for _p in (SITE, os.path.join(r"\#(stdlib)", "site-packages")):
               if _p not in sys.path:
                   sys.path.append(_p)
 
@@ -636,220 +636,191 @@ jobs:
               }
           }
           CODEIDE_UPD_0
-          cat > Sources/Packages.swift <<'CODEIDE_UPD_1'
-          import Foundation
+          cat > Sources/Bridge/PyBridge.c <<'CODEIDE_UPD_1'
+          #include <Python/Python.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include "PyBridge.h"
 
-          /// Handles `pip install` and `npm install` typed into the terminal.
-          enum PackageManager {
-              private static func folder(_ name: String) -> URL {
-                  let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                  let url = docs.appendingPathComponent(name, isDirectory: true)
-                  try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-                  return url
+          static ide_out_cb g_out = NULL;
+          static ide_in_cb g_in = NULL;
+          static unsigned long g_run_thread = 0;
+          static PyObject *g_run_fn = NULL;
+          static PyObject *g_repl_fn = NULL;
+
+          static void set_err(char *err, int len, const char *msg) {
+              if (err && len > 0) {
+                  strncpy(err, msg ? msg : "unknown error", (size_t)(len - 1));
+                  err[len - 1] = 0;
+              }
+          }
+
+          static PyObject *bridge_write(PyObject *self, PyObject *args) {
+              int stream;
+              const char *text;
+              if (!PyArg_ParseTuple(args, "is", &stream, &text)) return NULL;
+              if (g_out) g_out(stream, text);
+              Py_RETURN_NONE;
+          }
+
+          static PyObject *bridge_read(PyObject *self, PyObject *args) {
+              const char *prompt;
+              if (!PyArg_ParseTuple(args, "s", &prompt)) return NULL;
+              char *line = NULL;
+              if (g_in) {
+                  Py_BEGIN_ALLOW_THREADS
+                  line = g_in(prompt);
+                  Py_END_ALLOW_THREADS
+              }
+              if (!line) {
+                  PyErr_SetNone(PyExc_EOFError);
+                  return NULL;
+              }
+              PyObject *result = PyUnicode_FromString(line);
+              free(line);
+              return result;
+          }
+
+          static PyMethodDef bridge_methods[] = {
+              {"write", bridge_write, METH_VARARGS, "write(stream, text)"},
+              {"read", bridge_read, METH_VARARGS, "read(prompt) -> str"},
+              {NULL, NULL, 0, NULL}
+          };
+
+          static struct PyModuleDef bridge_module = {
+              PyModuleDef_HEAD_INIT, "_ide_bridge", NULL, -1, bridge_methods
+          };
+
+          static PyObject *PyInit__ide_bridge(void) {
+              return PyModule_Create(&bridge_module);
+          }
+
+          int ide_py_init(const char *home, const char *executable, const char *libdir,
+                          const char *bootstrap, ide_out_cb out, ide_in_cb inp,
+                          char *err, int errlen) {
+              g_out = out;
+              g_in = inp;
+
+              PyStatus status;
+              PyPreConfig preconfig;
+              PyPreConfig_InitIsolatedConfig(&preconfig);
+              preconfig.utf8_mode = 1;
+              status = Py_PreInitialize(&preconfig);
+              if (PyStatus_Exception(status)) {
+                  set_err(err, errlen, status.err_msg);
+                  return -1;
               }
 
-              static var sitePackages: URL { folder("site-packages") }
-              static var nodeModules: URL { folder("node_modules") }
-
-              static func isCommand(_ line: String) -> Bool {
-                  guard let first = line.split(separator: " ").first else { return false }
-                  return first == "pip" || first == "pip3" || first == "npm"
+              if (PyImport_AppendInittab("_ide_bridge", PyInit__ide_bridge) == -1) {
+                  set_err(err, errlen, "could not register bridge module");
+                  return -2;
               }
 
-              static func handle(_ line: String, term: Terminal) {
-                  let parts = line.split(separator: " ").map(String.init)
-                  guard let tool = parts.first else { return }
-                  let sub = parts.count > 1 ? parts[1] : ""
-                  let args = parts.dropFirst(2).filter { !$0.hasPrefix("-") }
-                  let isNpm = tool == "npm"
-                  switch sub {
-                  case "install", "i", "add":
-                      if args.isEmpty {
-                          term.emit(.err, "Usage: \(tool) install <package> [<package> ...]\n")
-                          return
-                      }
-                      if isNpm { npmInstall(Array(args), term: term) } else { pipInstall(Array(args), term: term) }
-                  case "list", "ls":
-                      list(isNpm: isNpm, term: term)
-                  default:
-                      term.emit(.info, "Supported commands: \(tool) install <package>, \(tool) list\n")
-                  }
-              }
+              PyConfig config;
+              PyConfig_InitIsolatedConfig(&config);
+              config.write_bytecode = 0;
+              config.buffered_stdio = 0;
+              config.install_signal_handlers = 0;
+              config.parse_argv = 0;
 
-              private static func list(isNpm: Bool, term: Terminal) {
-                  let fm = FileManager.default
-                  var names: [String]
-                  if isNpm {
-                      let items = (try? fm.contentsOfDirectory(atPath: nodeModules.path)) ?? []
-                      names = items.filter { !$0.hasPrefix(".") }.sorted()
-                  } else {
-                      let items = (try? fm.contentsOfDirectory(atPath: sitePackages.path)) ?? []
-                      names = items.filter { $0.hasSuffix(".dist-info") }.map { String($0.dropLast(10)) }.sorted()
-                  }
-                  term.emit(.out, names.isEmpty ? "(no packages installed)\n" : names.joined(separator: "\n") + "\n")
-              }
+              status = PyConfig_SetBytesString(&config, &config.home, home);
+              if (PyStatus_Exception(status)) goto fail;
+              status = PyConfig_SetBytesString(&config, &config.executable, executable);
+              if (PyStatus_Exception(status)) goto fail;
+              status = PyConfig_SetBytesString(&config, &config.program_name, executable);
+              if (PyStatus_Exception(status)) goto fail;
 
-              private static func fetch(_ url: URL) -> Data? {
-                  var result: Data?
-                  let sem = DispatchSemaphore(value: 0)
-                  var request = URLRequest(url: url)
-                  request.timeoutInterval = 60
-                  URLSession.shared.dataTask(with: request) { data, response, _ in
-                      if let http = response as? HTTPURLResponse, http.statusCode == 200 { result = data }
-                      sem.signal()
-                  }.resume()
-                  sem.wait()
-                  return result
-              }
-
-              // MARK: pip (pure-Python wheels, installed at runtime)
-
-              private static func pipInstall(_ names: [String], term: Terminal) {
-                  if let err = PythonEngine.shared.prepare() {
-                      term.emit(.err, err + "\n")
-                      return
-                  }
-                  var queue = names
-                  var seen = Set<String>()
-                  var installed: [String] = []
-                  while !queue.isEmpty {
-                      let raw = queue.removeFirst()
-                      let key = raw.lowercased().replacingOccurrences(of: "_", with: "-")
-                      if seen.contains(key) { continue }
-                      seen.insert(key)
-                      term.emit(.info, "Collecting \(raw)\n")
-                      guard let url = URL(string: "https://pypi.org/pypi/\(raw)/json"),
-                            let data = fetch(url),
-                            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                            let info = json["info"] as? [String: Any],
-                            let files = json["urls"] as? [[String: Any]] else {
-                          term.emit(.err, "ERROR: could not find '\(raw)' on PyPI (check the name and your internet connection)\n")
-                          continue
-                      }
-                      let version = info["version"] as? String ?? "?"
-                      guard let wheel = files.first(where: { ($0["filename"] as? String)?.hasSuffix("none-any.whl") == true }),
-                            let fileName = wheel["filename"] as? String,
-                            let wheelURLString = wheel["url"] as? String,
-                            let wheelURL = URL(string: wheelURLString) else {
-                          term.emit(.err, "ERROR: \(raw) has no pure-Python wheel because it contains compiled code. Add it to requirements-ios.txt in your repo to bundle it at build time.\n")
-                          continue
-                      }
-                      term.emit(.info, "  Downloading \(fileName)\n")
-                      guard let wheelData = fetch(wheelURL) else {
-                          term.emit(.err, "ERROR: download failed for \(raw)\n")
-                          continue
-                      }
-                      let tmp = NSTemporaryDirectory() + fileName
-                      do {
-                          try wheelData.write(to: URL(fileURLWithPath: tmp))
-                      } catch {
-                          term.emit(.err, "ERROR: could not save \(fileName)\n")
-                          continue
-                      }
-                      let code = "import zipfile\nzipfile.ZipFile(r\"\(tmp)\").extractall(r\"\(sitePackages.path)\")\n"
-                      PythonEngine.shared.run(code: code, fileName: "pip")
-                      try? FileManager.default.removeItem(atPath: tmp)
-                      installed.append("\(raw)-\(version)")
-
-                      if let deps = info["requires_dist"] as? [String] {
-                          let skipMarkers = ["extra", "win32", "Windows", "cygwin", "python_version <", "python_version<"]
-                          for dep in deps {
-                              let pieces = dep.components(separatedBy: ";")
-                              let marker = pieces.count > 1 ? pieces[1] : ""
-                              if skipMarkers.contains(where: { marker.contains($0) }) { continue }
-                              let head = pieces[0].trimmingCharacters(in: .whitespaces)
-                              let depName = String(head.prefix(while: { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" || $0 == "_" }))
-                              if !depName.isEmpty { queue.append(depName) }
-                          }
-                      }
-                  }
-                  if installed.isEmpty {
-                      term.emit(.err, "Nothing was installed.\n")
-                  } else {
-                      term.emit(.out, "Successfully installed " + installed.joined(separator: " ") + "\n")
+              config.module_search_paths_set = 1;
+              {
+                  char dyn[4096];
+                  snprintf(dyn, sizeof(dyn), "%s/lib-dynload", libdir);
+                  const char *paths[2] = { libdir, dyn };
+                  for (int i = 0; i < 2; i++) {
+                      wchar_t *w = Py_DecodeLocale(paths[i], NULL);
+                      if (!w) { set_err(err, errlen, "could not decode path"); PyConfig_Clear(&config); return -3; }
+                      status = PyWideStringList_Append(&config.module_search_paths, w);
+                      PyMem_RawFree(w);
+                      if (PyStatus_Exception(status)) goto fail;
                   }
               }
 
-              // MARK: npm (installed at runtime, loaded with require())
+              status = Py_InitializeFromConfig(&config);
+              if (PyStatus_Exception(status)) goto fail;
+              PyConfig_Clear(&config);
 
-              private static func npmInstall(_ specs: [String], term: Terminal) {
-                  if let err = PythonEngine.shared.prepare() {
-                      term.emit(.err, err + "\n")
-                      return
-                  }
-                  var queue = specs
-                  var seen = Set<String>()
-                  var installed: [String] = []
-                  while !queue.isEmpty {
-                      let spec = queue.removeFirst()
-                      var name = spec
-                      var version = "latest"
-                      let start = spec.hasPrefix("@") ? spec.index(after: spec.startIndex) : spec.startIndex
-                      if let at = spec[start...].firstIndex(of: "@") {
-                          name = String(spec[..<at])
-                          version = String(spec[spec.index(after: at)...])
-                      }
-                      if seen.contains(name) { continue }
-                      seen.insert(name)
-                      term.emit(.info, "Fetching \(name)\n")
-                      let encoded = name.replacingOccurrences(of: "/", with: "%2F")
-                      guard let url = URL(string: "https://registry.npmjs.org/\(encoded)/\(version)"),
-                            let data = fetch(url),
-                            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                            let dist = json["dist"] as? [String: Any],
-                            let tarball = dist["tarball"] as? String,
-                            let tarURL = URL(string: tarball),
-                            let archive = fetch(tarURL) else {
-                          term.emit(.err, "ERROR: could not download '\(spec)' from the npm registry\n")
-                          continue
-                      }
-                      let resolved = json["version"] as? String ?? version
-                      let tmp = NSTemporaryDirectory() + "npm-\(UUID().uuidString).tgz"
-                      do {
-                          try archive.write(to: URL(fileURLWithPath: tmp))
-                      } catch {
-                          term.emit(.err, "ERROR: could not save the package archive\n")
-                          continue
-                      }
-                      let dest = nodeModules.appendingPathComponent(name).path
-                      let code = """
-          import tarfile, os, shutil
-          dest = r"\(dest)"
-          shutil.rmtree(dest, ignore_errors=True)
-          os.makedirs(dest, exist_ok=True)
-          with tarfile.open(r"\(tmp)") as t:
-              for m in t.getmembers():
-                  parts = m.name.split("/", 1)
-                  if len(parts) < 2 or not parts[1] or ".." in parts[1].split("/"):
-                      continue
-                  m.name = parts[1]
-                  if m.isfile() or m.isdir():
-                      t.extract(m, dest, filter="data")
-
-          """
-                      PythonEngine.shared.run(code: code, fileName: "npm")
-                      try? FileManager.default.removeItem(atPath: tmp)
-                      installed.append("\(name)@\(resolved)")
-                      if let deps = json["dependencies"] as? [String: String] {
-                          queue.append(contentsOf: deps.keys.sorted())
-                      }
-                  }
-                  if installed.isEmpty {
-                      term.emit(.err, "Nothing was installed.\n")
-                  } else {
-                      term.emit(.out, "Installed " + installed.joined(separator: " ") + "\nUse it with: const x = require(\"name\");\n")
-                  }
+              PyObject *main_mod = PyImport_AddModule("__main__");
+              PyObject *dict = main_mod ? PyModule_GetDict(main_mod) : NULL;
+              PyObject *res = dict ? PyRun_String(bootstrap, Py_file_input, dict, dict) : NULL;
+              if (!res) {
+                  char buf[600];
+                  const char *tname = "error";
+                  const char *msg = NULL;
+                  PyObject *t = NULL, *v = NULL, *tb = NULL, *str = NULL;
+                  PyErr_Fetch(&t, &v, &tb);
+                  PyErr_NormalizeException(&t, &v, &tb);
+                  if (t) tname = ((PyTypeObject *)t)->tp_name;
+                  if (v) str = PyObject_Str(v);
+                  if (str) msg = PyUnicode_AsUTF8(str);
+                  snprintf(buf, sizeof(buf), "bootstrap script failed: %s: %s", tname, msg ? msg : "(no message)");
+                  set_err(err, errlen, buf);
+                  PyErr_Clear();
+                  return -4;
               }
+              Py_DECREF(res);
+
+              g_run_fn = dict ? PyDict_GetItemString(dict, "_ide_run") : NULL;
+              g_repl_fn = dict ? PyDict_GetItemString(dict, "_ide_repl") : NULL;
+              if (!g_run_fn || !g_repl_fn) {
+                  set_err(err, errlen, "runner functions missing");
+                  return -5;
+              }
+              Py_INCREF(g_run_fn);
+              Py_INCREF(g_repl_fn);
+
+              PyEval_SaveThread();
+              return 0;
+
+          fail:
+              set_err(err, errlen, status.err_msg);
+              PyConfig_Clear(&config);
+              return -6;
+          }
+
+          void ide_py_run(const char *code, const char *name) {
+              PyGILState_STATE st = PyGILState_Ensure();
+              g_run_thread = PyThread_get_thread_ident();
+              PyObject *r = PyObject_CallFunction(g_run_fn, "ss", code, name);
+              if (!r) PyErr_Print(); else Py_DECREF(r);
+              g_run_thread = 0;
+              PyGILState_Release(st);
+          }
+
+          void ide_py_repl(const char *line) {
+              PyGILState_STATE st = PyGILState_Ensure();
+              g_run_thread = PyThread_get_thread_ident();
+              PyObject *r = PyObject_CallFunction(g_repl_fn, "s", line);
+              if (!r) PyErr_Print(); else Py_DECREF(r);
+              g_run_thread = 0;
+              PyGILState_Release(st);
+          }
+
+          void ide_py_interrupt(void) {
+              unsigned long t = g_run_thread;
+              if (!t) return;
+              PyGILState_STATE st = PyGILState_Ensure();
+              PyThreadState_SetAsyncExc(t, PyExc_KeyboardInterrupt);
+              PyGILState_Release(st);
           }
           CODEIDE_UPD_1
           if [ ! -f requirements-ios.txt ]; then
           printf '# One package per line (for example: numpy). They are compiled into the app at build time.\n# Only packages that publish iOS wheels will work.\n' > requirements-ios.txt
           fi
-          touch .update-packages-v1
+          touch .update-fix-v2
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "Add pip and npm package support"
+          git commit -m "Fix Python startup and report bootstrap errors"
           git push origin HEAD
           fi
 
