@@ -1,6 +1,6 @@
-name: CodeIDE
+name: PyScripta
 options:
-  bundleIdPrefix: com.codeide
+  bundleIdPrefix: com.pyscripta
   deploymentTarget:
     iOS: "16.0"
 settings:
@@ -10,21 +10,21 @@ settings:
     CODE_SIGNING_REQUIRED: "NO"
     CODE_SIGN_IDENTITY: ""
 targets:
-  CodeIDE:
+  PyScripta:
     type: application
     platform: iOS
     sources:
       - path: Sources
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.codeide.app
-        PRODUCT_NAME: CodeIDE
+        PRODUCT_BUNDLE_IDENTIFIER: com.pyscripta.app
+        PRODUCT_NAME: PyScripta
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridge/Bridging-Header.h
         TARGETED_DEVICE_FAMILY: "1,2"
     info:
       path: Config/Info.plist
       properties:
-        CFBundleDisplayName: Code IDE
+        CFBundleDisplayName: PyScripta
         CFBundleShortVersionString: "1.0"
         CFBundleVersion: "1"
         UILaunchScreen: {}
