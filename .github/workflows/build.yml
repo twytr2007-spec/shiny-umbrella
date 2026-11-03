@@ -14,10 +14,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Apply UI update (first run only)
+      - name: Apply highlighting update (first run only)
         run: |
-          if [ ! -f .update-ui-v3 ]; then
-          echo "Applying UI update"
+          if [ ! -f .update-fstring-v4 ]; then
+          echo "Applying highlighting update"
           cat > Sources/Theme.swift <<'CODEIDE_UPD_0'
           import SwiftUI
           import UIKit
@@ -31,7 +31,7 @@ jobs:
           }
 
           struct Theme: Identifiable {
-              enum Role { case keyword, string, comment, number, builtin, function }
+              enum Role { case keyword, string, comment, number, builtin, function, brace }
 
               let id: String
               let name: String
@@ -82,6 +82,7 @@ jobs:
                   case .number: return number
                   case .builtin: return builtin
                   case .function: return function
+                  case .brace: return isDark ? 0xFFD700 : 0x0431FA
                   }
               }
 
@@ -122,273 +123,165 @@ jobs:
               }
           }
           CODEIDE_UPD_0
-          cat > Sources/Models.swift <<'CODEIDE_UPD_1'
+          cat > Sources/Highlighter.swift <<'CODEIDE_UPD_1'
           import Foundation
 
-          enum Language: String, CaseIterable, Identifiable {
-              case python, javascript
-
-              var id: String { rawValue }
-              var title: String { self == .python ? "Python" : "JavaScript" }
-              var ext: String { self == .python ? "py" : "js" }
-              var icon: String { self == .python ? "chevron.left.forwardslash.chevron.right" : "curlybraces" }
-              var prompt: String { self == .python ? ">>>" : ">" }
-              var runner: String { self == .python ? "python" : "node" }
-
-              static func from(fileName: String) -> Language {
-                  fileName.lowercased().hasSuffix(".js") ? .javascript : .python
-              }
-          }
-
-          struct CodeFile: Identifiable, Equatable {
-              var name: String
-              var content: String
-              var id: String { name }
-              var language: Language { Language.from(fileName: name) }
-          }
-
-          enum Templates {
-              static func list(for language: Language) -> [(title: String, code: String)] {
-                  switch language {
-                  case .python:
-                      return [
-                          ("Hello World", "print(\"Hello, World!\")\n"),
-                          ("Loops", """
-          for i in range(1, 6):
-              print(f"Number {i}: square = {i * i}")
-
-          total = sum(range(1, 101))
-          print("Sum 1..100 =", total)
-          """),
-                          ("Functions & classes", """
-          def fib(n):
-              a, b = 0, 1
-              for _ in range(n):
-                  yield a
-                  a, b = b, a + b
-
-          print(list(fib(12)))
-
-
-          class Dog:
-              def __init__(self, name):
-                  self.name = name
-
-              def speak(self):
-                  return f"{self.name} says Woof!"
-
-
-          print(Dog("Rex").speak())
-          """),
-                          ("User input", """
-          name = input("What is your name? ")
-          age = int(input("How old are you? "))
-          print(f"Hello {name}! Next year you will be {age + 1}.")
-          """)
-                      ]
-                  case .javascript:
-                      return [
-                          ("Hello World", "console.log(\"Hello, World!\");\n"),
-                          ("Loops", """
-          for (let i = 1; i <= 5; i++) {
-            console.log(`Number ${i}: square = ${i * i}`);
-          }
-
-          const total = Array.from({ length: 100 }, (_, i) => i + 1).reduce((a, b) => a + b, 0);
-          console.log("Sum 1..100 =", total);
-          """),
-                          ("Functions & async", """
-          function fib(n) {
-            const out = [];
-            let a = 0, b = 1;
-            for (let i = 0; i < n; i++) {
-              out.push(a);
-              [a, b] = [b, a + b];
-            }
-            return out;
-          }
-
-          console.log(fib(12));
-
-          const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-          async function main() {
-            console.log("Waiting...");
-            await wait(500);
-            console.log("Done!");
-          }
-
-          main();
-          """),
-                          ("User input", """
-          const name = prompt("What is your name?");
-          const age = parseInt(prompt("How old are you?"));
-          console.log(`Hello ${name}! Next year you will be ${age + 1}.`);
-          """)
-                      ]
-                  }
-              }
-          }
-
-          final class ProjectStore: ObservableObject {
-              static let directory: URL = {
-                  let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                  let dir = docs.appendingPathComponent("Projects", isDirectory: true)
-                  try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-                  return dir
-              }()
-
-              @Published var files: [CodeFile] = []
-              @Published var currentName: String = ""
-              @Published var openTabs: [String] = []
-              private var pendingSaves: [String: DispatchWorkItem] = [:]
-
-              init() {
-                  reload()
-                  if files.isEmpty {
-                      create(baseName: "main", language: .javascript, content: Templates.list(for: .javascript)[0].code)
-                      create(baseName: "main", language: .python, content: Templates.list(for: .python)[0].code)
-                  }
-                  let start = files.first(where: { $0.name == "main.py" })?.name ?? files[0].name
-                  currentName = start
-                  openTabs = [start]
+          enum Highlighter {
+              struct Rule {
+                  let regex: NSRegularExpression
+                  let role: Theme.Role?
+                  let classify: ((String) -> Theme.Role)?
               }
 
-              var current: CodeFile? { files.first(where: { $0.name == currentName }) }
-
-              func url(for name: String) -> URL {
-                  Self.directory.appendingPathComponent(name)
+              struct Interpolation {
+                  let open: NSRange
+                  let close: NSRange
+                  let inner: NSRange
               }
 
-              func reload() {
-                  let names = (try? FileManager.default.contentsOfDirectory(atPath: Self.directory.path)) ?? []
-                  files = names
-                      .filter { $0.hasSuffix(".py") || $0.hasSuffix(".js") }
-                      .sorted()
-                      .compactMap { n in
-                          guard let text = try? String(contentsOf: url(for: n), encoding: .utf8) else { return nil }
-                          return CodeFile(name: n, content: text)
+              struct StringInfo {
+                  var items: [Interpolation] = []
+                  var prefixes: [NSRange] = []
+              }
+
+              private static func rule(_ pattern: String, _ role: Theme.Role) -> Rule {
+                  Rule(regex: try! NSRegularExpression(pattern: pattern, options: []), role: role, classify: nil)
+              }
+
+              private static func combined(_ regex: NSRegularExpression, _ classify: @escaping (String) -> Theme.Role) -> Rule {
+                  Rule(regex: regex, role: nil, classify: classify)
+              }
+
+              private static let pyStringRegex = try! NSRegularExpression(
+                  pattern: ##"(?:[rRbBfFuU]{0,2}(?:"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'))|#.*"##,
+                  options: [])
+
+              private static let jsStringRegex = try! NSRegularExpression(
+                  pattern: ##""(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\[\s\S]|[^`\\])*`|//.*|/\*[\s\S]*?\*/"##,
+                  options: [])
+
+              private static func pyClassify(_ s: String) -> Theme.Role {
+                  s.hasPrefix("#") ? .comment : .string
+              }
+
+              private static func jsClassify(_ s: String) -> Theme.Role {
+                  (s.hasPrefix("//") || s.hasPrefix("/*")) ? .comment : .string
+              }
+
+              static let python: [Rule] = [
+                  rule(##"\b[A-Za-z_][A-Za-z0-9_]*(?=\()"##, .function),
+                  rule(##"\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b"##, .number),
+                  rule(##"\b(?:print|input|len|range|int|str|float|list|dict|set|tuple|bool|open|type|isinstance|enumerate|zip|map|filter|sum|min|max|abs|sorted|reversed|round|any|all|super|self|cls|object|repr|format|iter|next)\b"##, .builtin),
+                  rule(##"\b(?:False|None|True|and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield|match|case)\b"##, .keyword),
+                  rule(##"(?<=def )[A-Za-z_][A-Za-z0-9_]*"##, .function),
+                  rule(##"(?<=class )[A-Za-z_][A-Za-z0-9_]*"##, .builtin),
+                  combined(pyStringRegex, { pyClassify($0) })
+              ]
+
+              static let javascript: [Rule] = [
+                  rule(##"\b[A-Za-z_$][A-Za-z0-9_$]*(?=\()"##, .function),
+                  rule(##"\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b"##, .number),
+                  rule(##"\b(?:true|false|null|undefined|NaN|Infinity)\b"##, .number),
+                  rule(##"\b(?:console|Math|JSON|Object|Array|String|Number|Boolean|Date|Promise|Map|Set|Symbol|Error|RegExp|parseInt|parseFloat|setTimeout|setInterval|clearTimeout|clearInterval|prompt|alert|process|require)\b"##, .builtin),
+                  rule(##"\b(?:break|case|catch|class|const|continue|debugger|default|delete|do|else|export|extends|finally|for|function|if|import|in|instanceof|let|new|return|super|switch|this|throw|try|typeof|var|void|while|with|yield|async|await|of|static|get|set)\b"##, .keyword),
+                  rule(##"(?<=function )[A-Za-z_$][A-Za-z0-9_$]*"##, .function),
+                  rule(##"(?<=class )[A-Za-z_$][A-Za-z0-9_$]*"##, .builtin),
+                  combined(jsStringRegex, { jsClassify($0) })
+              ]
+
+              static func rules(for language: Language) -> [Rule] {
+                  language == .python ? python : javascript
+              }
+
+              /// Finds `{expr}` inside Python f-strings and `${expr}` inside JavaScript template literals.
+              static func interpolations(in text: NSString, language: Language) -> StringInfo {
+                  var info = StringInfo()
+                  let isPython = language == .python
+                  let regex = isPython ? pyStringRegex : jsStringRegex
+                  let all = NSRange(location: 0, length: text.length)
+
+                  regex.enumerateMatches(in: text as String, options: [], range: all) { match, _, _ in
+                      guard let m = match else { return }
+                      let r = m.range
+                      let s = text.substring(with: r)
+                      let role: Theme.Role = isPython ? pyClassify(s) : jsClassify(s)
+                      if role != .string { return }
+                      let u = Array(s.utf16)
+                      var contentStart = 0
+                      var contentEnd = u.count
+
+                      if isPython {
+                          var p = 0
+                          while p < u.count && ((u[p] >= 65 && u[p] <= 90) || (u[p] >= 97 && u[p] <= 122)) { p += 1 }
+                          guard p < u.count else { return }
+                          let prefix = (s as NSString).substring(to: p).lowercased()
+                          if p > 0 { info.prefixes.append(NSRange(location: r.location, length: p)) }
+                          if !prefix.contains("f") { return }
+                          let quote = u[p]
+                          let triple = u.count >= p + 6 && u[p + 1] == quote && u[p + 2] == quote
+                          let qlen = triple ? 3 : 1
+                          contentStart = p + qlen
+                          contentEnd = u.count - qlen
+                      } else {
+                          guard u.count >= 2, u[0] == 96 else { return }
+                          contentStart = 1
+                          contentEnd = u.count - 1
                       }
-              }
+                      if contentEnd < contentStart { return }
+                      let end = contentEnd
 
-              // MARK: Tabs
+                      func closingBrace(from start: Int) -> Int? {
+                          var depth = 1
+                          var j = start
+                          while j < end {
+                              if u[j] == 123 {
+                                  depth += 1
+                              } else if u[j] == 125 {
+                                  depth -= 1
+                                  if depth == 0 { return j }
+                              }
+                              j += 1
+                          }
+                          return nil
+                      }
 
-              func open(_ name: String) {
-                  guard files.contains(where: { $0.name == name }) else { return }
-                  if name != currentName { saveNow(currentName) }
-                  if !openTabs.contains(name) { openTabs.append(name) }
-                  currentName = name
-              }
-
-              func closeTab(_ name: String) {
-                  guard openTabs.count > 1, let i = openTabs.firstIndex(of: name) else { return }
-                  saveNow(name)
-                  openTabs.remove(at: i)
-                  if currentName == name {
-                      currentName = openTabs[min(i, openTabs.count - 1)]
+                      var i = contentStart
+                      while i < end {
+                          let c = u[i]
+                          if isPython {
+                              if c == 123 {
+                                  if i + 1 < end && u[i + 1] == 123 {
+                                      i += 2
+                                  } else if let close = closingBrace(from: i + 1) {
+                                      info.items.append(Interpolation(
+                                          open: NSRange(location: r.location + i, length: 1),
+                                          close: NSRange(location: r.location + close, length: 1),
+                                          inner: NSRange(location: r.location + i + 1, length: close - i - 1)))
+                                      i = close + 1
+                                  } else {
+                                      i += 1
+                                  }
+                              } else if c == 125 && i + 1 < end && u[i + 1] == 125 {
+                                  i += 2
+                              } else {
+                                  i += 1
+                              }
+                          } else {
+                              if c == 92 {
+                                  i += 2
+                              } else if c == 36 && i + 1 < end && u[i + 1] == 123, let close = closingBrace(from: i + 2) {
+                                  info.items.append(Interpolation(
+                                      open: NSRange(location: r.location + i, length: 2),
+                                      close: NSRange(location: r.location + close, length: 1),
+                                      inner: NSRange(location: r.location + i + 2, length: close - i - 2)))
+                                  i = close + 1
+                              } else {
+                                  i += 1
+                              }
+                          }
+                      }
                   }
-              }
-
-              // MARK: Files
-
-              private static func cleanBase(_ baseName: String, ext: String) -> String {
-                  var base = baseName.trimmingCharacters(in: .whitespacesAndNewlines)
-                  let bad = CharacterSet(charactersIn: "/\\:*?\"<>|")
-                  base = base.components(separatedBy: bad).joined(separator: "_")
-                  if base.lowercased().hasSuffix("." + ext) {
-                      base = String(base.dropLast(ext.count + 1))
-                  }
-                  return base
-              }
-
-              @discardableResult
-              func create(baseName: String, language: Language, content: String) -> String {
-                  var base = Self.cleanBase(baseName, ext: language.ext)
-                  if base.isEmpty { base = "script" }
-                  var name = "\(base).\(language.ext)"
-                  var i = 2
-                  while files.contains(where: { $0.name == name }) {
-                      name = "\(base)\(i).\(language.ext)"
-                      i += 1
-                  }
-                  files.append(CodeFile(name: name, content: content))
-                  files.sort { $0.name < $1.name }
-                  try? content.write(to: url(for: name), atomically: true, encoding: .utf8)
-                  if !currentName.isEmpty { saveNow(currentName) }
-                  if !openTabs.contains(name) { openTabs.append(name) }
-                  currentName = name
-                  return name
-              }
-
-              func rename(_ old: String, to newBase: String) {
-                  guard let i = files.firstIndex(where: { $0.name == old }) else { return }
-                  saveNow(old)
-                  let ext = files[i].language.ext
-                  let base = Self.cleanBase(newBase, ext: ext)
-                  if base.isEmpty { return }
-                  let newName = "\(base).\(ext)"
-                  if newName == old || files.contains(where: { $0.name == newName }) { return }
-                  do {
-                      try FileManager.default.moveItem(at: url(for: old), to: url(for: newName))
-                  } catch {
-                      return
-                  }
-                  files[i].name = newName
-                  files.sort { $0.name < $1.name }
-                  openTabs = openTabs.map { $0 == old ? newName : $0 }
-                  if currentName == old { currentName = newName }
-              }
-
-              func duplicate(_ name: String) {
-                  guard let f = files.first(where: { $0.name == name }) else { return }
-                  saveNow(name)
-                  let base = (name as NSString).deletingPathExtension + "_copy"
-                  create(baseName: base, language: f.language, content: f.content)
-              }
-
-              func importFile(_ fileURL: URL) {
-                  let access = fileURL.startAccessingSecurityScopedResource()
-                  defer { if access { fileURL.stopAccessingSecurityScopedResource() } }
-                  guard let text = try? String(contentsOf: fileURL, encoding: .utf8) else { return }
-                  let language: Language = fileURL.pathExtension.lowercased() == "js" ? .javascript : .python
-                  create(baseName: fileURL.deletingPathExtension().lastPathComponent, language: language, content: text)
-              }
-
-              func updateCurrent(_ text: String) {
-                  guard let i = files.firstIndex(where: { $0.name == currentName }),
-                        files[i].content != text else { return }
-                  files[i].content = text
-                  scheduleSave(currentName)
-              }
-
-              private func scheduleSave(_ name: String) {
-                  pendingSaves[name]?.cancel()
-                  let item = DispatchWorkItem { [weak self] in self?.saveNow(name) }
-                  pendingSaves[name] = item
-                  DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: item)
-              }
-
-              func saveNow(_ name: String) {
-                  pendingSaves[name]?.cancel()
-                  pendingSaves[name] = nil
-                  guard let f = files.first(where: { $0.name == name }) else { return }
-                  try? f.content.write(to: url(for: name), atomically: true, encoding: .utf8)
-              }
-
-              func saveAll() {
-                  for f in files { saveNow(f.name) }
-              }
-
-              func delete(_ name: String) {
-                  try? FileManager.default.removeItem(at: url(for: name))
-                  files.removeAll(where: { $0.name == name })
-                  openTabs.removeAll(where: { $0 == name })
-                  if files.isEmpty {
-                      create(baseName: "main", language: .python, content: Templates.list(for: .python)[0].code)
-                  } else {
-                      if openTabs.isEmpty { openTabs = [files[0].name] }
-                      if currentName == name { currentName = openTabs[0] }
-                  }
+                  return info
               }
           }
           CODEIDE_UPD_1
@@ -659,6 +552,8 @@ jobs:
                   var layout: GutterLayoutManager?
                   var lastKey = ""
                   private var currentInset: CGFloat = -1
+                  private var accessoryBar: UIInputView?
+                  private var accessoryButtons: [UIButton] = []
 
                   init(_ parent: CodeEditor) { self.parent = parent }
 
@@ -679,6 +574,17 @@ jobs:
                           l.highlightColor = theme.ui(theme.text).withAlphaComponent(0.07)
                       }
                       currentInset = -1
+                      styleAccessory()
+                  }
+
+                  func styleAccessory() {
+                      let t = parent.theme
+                      accessoryBar?.backgroundColor = t.ui(t.panel)
+                      for b in accessoryButtons {
+                          b.backgroundColor = t.ui(t.tabInactive)
+                          b.setTitleColor(t.ui(t.text), for: .normal)
+                          b.tintColor = t.ui(t.text)
+                      }
                   }
 
                   func textViewDidChange(_ tv: UITextView) {
@@ -791,21 +697,40 @@ jobs:
                       let ns = string as NSString
                       let full = NSRange(location: 0, length: ns.length)
 
+                      func apply(_ rules: [Highlighter.Rule], _ range: NSRange) {
+                          for rule in rules {
+                              rule.regex.enumerateMatches(in: string, options: [], range: range) { match, _, _ in
+                                  guard let m = match else { return }
+                                  let role: Theme.Role
+                                  if let fixed = rule.role {
+                                      role = fixed
+                                  } else if let classify = rule.classify {
+                                      role = classify(ns.substring(with: m.range))
+                                  } else {
+                                      return
+                                  }
+                                  storage.addAttribute(.foregroundColor, value: theme.ui(theme.hex(for: role)), range: m.range)
+                              }
+                          }
+                      }
+
                       storage.beginEditing()
                       storage.setAttributes(base, range: full)
-                      for rule in Highlighter.rules(for: parent.language) {
-                          rule.regex.enumerateMatches(in: string, options: [], range: full) { match, _, _ in
-                              guard let m = match else { return }
-                              let role: Theme.Role
-                              if let fixed = rule.role {
-                                  role = fixed
-                              } else if let classify = rule.classify {
-                                  role = classify(ns.substring(with: m.range))
-                              } else {
-                                  return
-                              }
-                              storage.addAttribute(.foregroundColor, value: theme.ui(theme.hex(for: role)), range: m.range)
-                          }
+                      let rules = Highlighter.rules(for: parent.language)
+                      apply(rules, full)
+
+                      // f-strings and template literals: braces get their own color, the inside is normal code
+                      let found = Highlighter.interpolations(in: ns, language: parent.language)
+                      let braceColor = theme.ui(theme.hex(for: .brace))
+                      let prefixColor = theme.ui(theme.hex(for: .keyword))
+                      for prefix in found.prefixes {
+                          storage.addAttribute(.foregroundColor, value: prefixColor, range: prefix)
+                      }
+                      for item in found.items {
+                          storage.addAttribute(.foregroundColor, value: theme.ui(theme.text), range: item.inner)
+                          apply(rules, item.inner)
+                          storage.addAttribute(.foregroundColor, value: braceColor, range: item.open)
+                          storage.addAttribute(.foregroundColor, value: braceColor, range: item.close)
                       }
                       storage.endEditing()
                       tv.typingAttributes = base
@@ -835,17 +760,16 @@ jobs:
                       if let img = image {
                           button.setImage(UIImage(systemName: img), for: .normal)
                       }
-                      button.setTitleColor(.label, for: .normal)
-                      button.tintColor = .label
-                      button.backgroundColor = UIColor.secondarySystemFill
-                      button.layer.cornerRadius = 6
+                      button.layer.cornerRadius = 7
+                      accessoryButtons.append(button)
                       button.widthAnchor.constraint(greaterThanOrEqualToConstant: wide ? 46 : 38).isActive = true
                       button.addAction(UIAction { _ in action() }, for: .touchUpInside)
                       return button
                   }
 
                   func makeAccessory() -> UIView {
-                      let bar = UIInputView(frame: CGRect(x: 0, y: 0, width: 320, height: 44), inputViewStyle: .keyboard)
+                      let bar = UIInputView(frame: CGRect(x: 0, y: 0, width: 320, height: 44), inputViewStyle: .default)
+                      accessoryBar = bar
                       let scroll = UIScrollView()
                       scroll.showsHorizontalScrollIndicator = false
                       scroll.translatesAutoresizingMaskIntoConstraints = false
@@ -885,184 +809,13 @@ jobs:
                           stack.addArrangedSubview(makeButton(title: key.0) { ctl.insert(key.1, back: key.2) })
                       }
                       stack.addArrangedSubview(makeButton(image: "keyboard.chevron.compact.down", wide: true) { ctl.dismissKeyboard() })
+                      styleAccessory()
                       return bar
                   }
               }
           }
           CODEIDE_UPD_2
-          cat > Sources/TerminalView.swift <<'CODEIDE_UPD_3'
-          import SwiftUI
-          import UIKit
-
-          struct TerminalView: View {
-              @ObservedObject var term: Terminal
-              let theme: Theme
-              let fontSize: Double
-              let language: Language
-              @Binding var mode: Int   // 0 = collapsed, 1 = normal, 2 = large
-
-              @State private var input = ""
-              @State private var history: [String] = []
-              @State private var historyIndex = 0
-              @FocusState private var focused: Bool
-
-              private func color(for seg: Terminal.Seg) -> Color {
-                  if let fg = seg.fg { return Color(hex: fg) }
-                  switch seg.kind {
-                  case .out: return theme.textColor
-                  case .err: return theme.errorColor
-                  case .input: return theme.accentColor
-                  case .info: return theme.commentColor
-                  case .result: return theme.builtinColor
-                  }
-              }
-
-              private var mono: Font { .system(size: CGFloat(fontSize), design: .monospaced) }
-
-              var body: some View {
-                  VStack(spacing: 0) {
-                      header
-                      if mode != 0 {
-                          ScrollViewReader { proxy in
-                              ScrollView {
-                                  VStack(alignment: .leading, spacing: 0) {
-                                      output
-                                      Color.clear.frame(height: 1).id("end")
-                                  }
-                                  .padding(10)
-                              }
-                              .onChange(of: term.version) { _ in
-                                  proxy.scrollTo("end", anchor: .bottom)
-                              }
-                          }
-                          Rectangle().fill(theme.borderColor).frame(height: 1)
-                          inputBar
-                      }
-                  }
-                  .background(theme.bgColor)
-              }
-
-              private var header: some View {
-                  HStack(spacing: 16) {
-                      VStack(spacing: 0) {
-                          Text("TERMINAL")
-                              .font(.system(size: 11, weight: .semibold))
-                              .foregroundColor(theme.textColor)
-                              .padding(.top, 11)
-                              .padding(.bottom, 8)
-                          Rectangle().fill(theme.accentColor).frame(height: 1.5)
-                      }
-                      .fixedSize()
-                      Text(language.title)
-                          .font(.system(size: 11, design: .monospaced))
-                          .foregroundColor(theme.commentColor)
-                      if term.isRunning {
-                          ProgressView().scaleEffect(0.6)
-                      }
-                      Spacer()
-                      Button {
-                          UIPasteboard.general.string = term.plainText()
-                      } label: { Image(systemName: "doc.on.doc") }
-                      Button { term.clear() } label: { Image(systemName: "trash") }
-                      Button { mode = (mode == 2) ? 1 : 2 } label: {
-                          Image(systemName: mode == 2 ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
-                      }
-                      Button { mode = (mode == 0) ? 1 : 0 } label: {
-                          Image(systemName: mode == 0 ? "chevron.up" : "chevron.down")
-                      }
-                  }
-                  .font(.system(size: 14))
-                  .foregroundColor(theme.commentColor)
-                  .padding(.horizontal, 12)
-                  .frame(height: 38)
-                  .background(theme.panelColor)
-              }
-
-              private var output: some View {
-                  let combined = term.segs.reduce(Text("")) { (acc: Text, seg: Terminal.Seg) -> Text in
-                      var piece = Text(seg.text).foregroundColor(color(for: seg))
-                      if seg.bold { piece = piece.bold() }
-                      return acc + piece
-                  }
-                  return Group {
-                      if term.segs.isEmpty {
-                          Text("Press Run to execute your code, or type a command below.")
-                              .foregroundColor(theme.commentColor)
-                      } else {
-                          combined
-                      }
-                  }
-                  .font(mono)
-                  .frame(maxWidth: .infinity, alignment: .leading)
-                  .textSelection(.enabled)
-              }
-
-              private var promptLabel: String {
-                  if term.waitingForInput { return "›" }
-                  if term.isRunning { return "…" }
-                  return language.prompt
-              }
-
-              private var placeholder: String {
-                  if term.waitingForInput { return "Type input and press return" }
-                  if term.isRunning { return "Running…" }
-                  return "\(language.title) command, or: pip install / npm install"
-              }
-
-              private var inputDisabled: Bool { term.isRunning && !term.waitingForInput }
-
-              private var inputBar: some View {
-                  HStack(spacing: 8) {
-                      Text(promptLabel)
-                          .font(.system(size: CGFloat(fontSize), weight: .bold, design: .monospaced))
-                          .foregroundColor(theme.accentColor)
-                      TextField(placeholder, text: $input)
-                          .font(mono)
-                          .foregroundColor(theme.textColor)
-                          .textInputAutocapitalization(.never)
-                          .autocorrectionDisabled(true)
-                          .submitLabel(.send)
-                          .focused($focused)
-                          .disabled(inputDisabled)
-                          .onSubmit { send() }
-                      Button { stepHistory(-1) } label: { Image(systemName: "chevron.up") }
-                          .disabled(history.isEmpty || inputDisabled)
-                      Button { stepHistory(1) } label: { Image(systemName: "chevron.down") }
-                          .disabled(history.isEmpty || inputDisabled)
-                      Button { send() } label: {
-                          Image(systemName: "return").foregroundColor(theme.accentColor)
-                      }
-                      .disabled(inputDisabled)
-                  }
-                  .font(.system(size: 14))
-                  .foregroundColor(theme.commentColor)
-                  .padding(.horizontal, 12)
-                  .padding(.vertical, 9)
-                  .background(theme.panelColor)
-                  .onChange(of: term.waitingForInput) { waiting in
-                      if waiting { focused = true }
-                  }
-              }
-
-              private func stepHistory(_ delta: Int) {
-                  guard !history.isEmpty else { return }
-                  historyIndex = max(0, min(history.count, historyIndex + delta))
-                  input = historyIndex < history.count ? history[historyIndex] : ""
-              }
-
-              private func send() {
-                  let text = input
-                  input = ""
-                  if !term.waitingForInput, !text.trimmingCharacters(in: .whitespaces).isEmpty {
-                      history.append(text)
-                  }
-                  historyIndex = history.count
-                  term.submit(text, language: language)
-                  focused = true
-              }
-          }
-          CODEIDE_UPD_3
-          cat > Sources/ContentView.swift <<'CODEIDE_UPD_4'
+          cat > Sources/ContentView.swift <<'CODEIDE_UPD_3'
           import SwiftUI
           import UniformTypeIdentifiers
 
@@ -1086,6 +839,7 @@ jobs:
               @State private var showFiles = false
               @State private var showNew = false
               @State private var showSettings = false
+              @State private var keyboardVisible = false
 
               private var theme: Theme { Theme.byID(themeID) }
               private var language: Language { store.current?.language ?? .python }
@@ -1138,6 +892,12 @@ jobs:
                   .preferredColorScheme(theme.isDark ? .dark : .light)
                   .tint(theme.accentColor)
                   .onChange(of: scenePhase) { _ in store.saveAll() }
+                  .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+                      keyboardVisible = true
+                  }
+                  .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+                      keyboardVisible = false
+                  }
                   .sheet(isPresented: $showFiles) {
                       FilesSheet(store: store, theme: theme)
                   }
@@ -1312,7 +1072,12 @@ jobs:
                   .padding(.horizontal, 12)
                   .frame(height: 24)
                   .frame(maxWidth: .infinity)
-                  .background(theme.statusColor.ignoresSafeArea(edges: .bottom))
+                  .background(theme.statusColor.ignoresSafeArea(edges: statusEdges))
+              }
+
+              private var statusEdges: Edge.Set {
+                  let none: Edge.Set = []
+                  return keyboardVisible ? none : .bottom
               }
 
               // MARK: Actions
@@ -1555,985 +1320,15 @@ jobs:
                   }
               }
           }
-          CODEIDE_UPD_4
-          cat > Sources/Terminal.swift <<'CODEIDE_UPD_5'
-          import Foundation
-          import JavaScriptCore
-          import SwiftUI
-
-          final class Terminal: ObservableObject {
-              static let shared = Terminal()
-
-              enum Kind { case out, err, input, info, result }
-
-              struct Seg {
-                  var kind: Kind
-                  var text: String
-                  var fg: UInt32? = nil
-                  var bold: Bool = false
-              }
-
-              @Published private(set) var segs: [Seg] = []
-              @Published private(set) var version = 0
-              @Published private(set) var isRunning = false
-              @Published private(set) var waitingForInput = false
-
-              private let lock = NSLock()
-              private var pending: [Seg] = []
-              private var flushScheduled = false
-              private var totalChars = 0
-              private var buf: [Seg] = []
-              private var ansiFG: UInt32?
-              private var ansiBold = false
-              private var ansiCarry = ""
-
-              private static let palette: [UInt32] = [
-                  0x666666, 0xCD3131, 0x0DBC79, 0xE5E510, 0x2472C8, 0xBC3FBC, 0x11A8CD, 0xE5E5E5,
-                  0x808080, 0xF14C4C, 0x23D18B, 0xF5F543, 0x3B8EEA, 0xD670D6, 0x29B8DB, 0xFFFFFF
-              ]
-
-              private static func color256(_ n: Int) -> UInt32 {
-                  if n < 0 { return palette[7] }
-                  if n < 16 { return palette[n] }
-                  if n < 232 {
-                      let v = n - 16
-                      let levels: [UInt32] = [0, 95, 135, 175, 215, 255]
-                      return (levels[v / 36] << 16) | (levels[(v / 6) % 6] << 8) | levels[v % 6]
-                  }
-                  let g = UInt32(min(255, 8 + 10 * (n - 232)))
-                  return (g << 16) | (g << 8) | g
-              }
-              private var activeToken = 0
-              private var inputValue: String?
-              private let inputSemaphore = DispatchSemaphore(value: 0)
-              private var stopRequested = false
-              private var currentLanguage: Language = .python
-              private var startTime = Date()
-
-              // MARK: Output (thread-safe)
-
-              func emit(_ kind: Kind, _ text: String) {
-                  guard !text.isEmpty else { return }
-                  lock.lock()
-                  pending.append(Seg(kind: kind, text: text))
-                  let schedule = !flushScheduled
-                  flushScheduled = true
-                  lock.unlock()
-                  if schedule {
-                      DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
-                          self?.flush()
-                      }
-                  }
-              }
-
-              private func flush() {
-                  lock.lock()
-                  let items = pending
-                  pending = []
-                  flushScheduled = false
-                  lock.unlock()
-                  for item in items {
-                      if item.kind == .out || item.kind == .err {
-                          appendParsed(item.kind, item.text)
-                      } else {
-                          push(item.kind, item.text, fg: nil, bold: false)
-                      }
-                  }
-                  while totalChars > 120_000 && buf.count > 1 {
-                      totalChars -= buf[0].text.count
-                      buf.removeFirst()
-                  }
-                  if buf.count == 1 && totalChars > 120_000 {
-                      buf[0].text = String(buf[0].text.suffix(100_000))
-                      totalChars = buf[0].text.count
-                  }
-                  segs = buf
-                  version += 1
-              }
-
-              private func push(_ kind: Kind, _ text: String, fg: UInt32?, bold: Bool) {
-                  if text.isEmpty { return }
-                  totalChars += text.count
-                  if let last = buf.last, last.kind == kind, last.fg == fg, last.bold == bold {
-                      buf[buf.count - 1].text += text
-                  } else {
-                      buf.append(Seg(kind: kind, text: text, fg: fg, bold: bold))
-                  }
-              }
-
-              private func eraseCurrentLine() {
-                  while let last = buf.last {
-                      if let nl = last.text.lastIndex(of: "\n") {
-                          let keep = String(last.text[...nl])
-                          totalChars -= last.text.count - keep.count
-                          buf[buf.count - 1].text = keep
-                          return
-                      }
-                      totalChars -= last.text.count
-                      buf.removeLast()
-                  }
-              }
-
-              private func applySGR(_ params: String) {
-                  let codes = params.split(separator: ";", omittingEmptySubsequences: false).map { Int($0) ?? 0 }
-                  if codes.isEmpty {
-                      ansiFG = nil
-                      ansiBold = false
-                      return
-                  }
-                  var k = 0
-                  while k < codes.count {
-                      let c = codes[k]
-                      switch c {
-                      case 0:
-                          ansiFG = nil
-                          ansiBold = false
-                      case 1:
-                          ansiBold = true
-                      case 22:
-                          ansiBold = false
-                      case 30...37:
-                          ansiFG = Terminal.palette[c - 30]
-                      case 39:
-                          ansiFG = nil
-                      case 90...97:
-                          ansiFG = Terminal.palette[c - 90 + 8]
-                      case 38, 48:
-                          if k + 2 < codes.count && codes[k + 1] == 5 {
-                              if c == 38 { ansiFG = Terminal.color256(codes[k + 2]) }
-                              k += 2
-                          } else if k + 4 < codes.count && codes[k + 1] == 2 {
-                              if c == 38 {
-                                  let r = UInt32(max(0, min(255, codes[k + 2])))
-                                  let g = UInt32(max(0, min(255, codes[k + 3])))
-                                  let b = UInt32(max(0, min(255, codes[k + 4])))
-                                  ansiFG = (r << 16) | (g << 8) | b
-                              }
-                              k += 4
-                          }
-                      default:
-                          break
-                      }
-                      k += 1
-                  }
-              }
-
-              /// Splits terminal output into colored segments (ANSI colors) and handles carriage returns.
-              private func appendParsed(_ kind: Kind, _ raw: String) {
-                  let text = (ansiCarry + raw).replacingOccurrences(of: "\r\n", with: "\n")
-                  ansiCarry = ""
-                  let chars = Array(text.unicodeScalars)
-                  var buffer = ""
-                  var i = 0
-                  while i < chars.count {
-                      let c = chars[i]
-                      if c == "\u{1B}" {
-                          if i + 1 >= chars.count {
-                              ansiCarry = "\u{1B}"
-                              break
-                          }
-                          let kindChar = chars[i + 1]
-                          if kindChar == "[" {
-                              var j = i + 2
-                              var params = ""
-                              while j < chars.count && chars[j].value >= 0x30 && chars[j].value <= 0x3F {
-                                  params.unicodeScalars.append(chars[j])
-                                  j += 1
-                              }
-                              while j < chars.count && chars[j].value >= 0x20 && chars[j].value <= 0x2F {
-                                  j += 1
-                              }
-                              if j >= chars.count {
-                                  var rest = String.UnicodeScalarView()
-                                  rest.append(contentsOf: chars[i...])
-                                  ansiCarry = String(rest)
-                                  break
-                              }
-                              push(kind, buffer, fg: ansiFG, bold: ansiBold)
-                              buffer = ""
-                              if chars[j] == "m" { applySGR(params) }
-                              i = j + 1
-                              continue
-                          } else if kindChar == "]" {
-                              var j = i + 2
-                              while j < chars.count {
-                                  if chars[j].value == 7 {
-                                      j += 1
-                                      break
-                                  }
-                                  if chars[j] == "\u{1B}" && j + 1 < chars.count && chars[j + 1] == "\\" {
-                                      j += 2
-                                      break
-                                  }
-                                  j += 1
-                              }
-                              i = j
-                              continue
-                          } else {
-                              i += 2
-                              continue
-                          }
-                      }
-                      if c == "\r" {
-                          push(kind, buffer, fg: ansiFG, bold: ansiBold)
-                          buffer = ""
-                          eraseCurrentLine()
-                          i += 1
-                          continue
-                      }
-                      buffer.unicodeScalars.append(c)
-                      i += 1
-                  }
-                  push(kind, buffer, fg: ansiFG, bold: ansiBold)
-              }
-
-              func plainText() -> String {
-                  buf.map { $0.text }.joined()
-              }
-
-              func clear() {
-                  lock.lock()
-                  pending = []
-                  lock.unlock()
-                  buf = []
-                  segs = []
-                  totalChars = 0
-                  ansiFG = nil
-                  ansiBold = false
-                  ansiCarry = ""
-                  version += 1
-              }
-
-              func isActive(_ token: Int) -> Bool {
-                  lock.lock()
-                  defer { lock.unlock() }
-                  return activeToken == token
-              }
-
-              // MARK: Running
-
-              private func beginRun(language: Language) -> Int {
-                  isRunning = true
-                  stopRequested = false
-                  currentLanguage = language
-                  startTime = Date()
-                  lock.lock()
-                  activeToken += 1
-                  let token = activeToken
-                  lock.unlock()
-                  return token
-              }
-
-              private func finish(token: Int, silent: Bool) {
-                  guard isActive(token) else { return }
-                  isRunning = false
-                  waitingForInput = false
-                  ansiFG = nil
-                  ansiBold = false
-                  if stopRequested {
-                      emit(.info, "\n■ Stopped\n")
-                  } else if !silent {
-                      emit(.info, String(format: "\n✓ Finished in %.2fs\n", Date().timeIntervalSince(startTime)))
-                  }
-                  stopRequested = false
-              }
-
-              func run(code: String, language: Language, fileName: String) {
-                  guard !isRunning else { return }
-                  let token = beginRun(language: language)
-                  emit(.info, "\n$ \(language.runner) \(fileName)\n")
-                  launch(token: token, silent: false) {
-                      switch language {
-                      case .python:
-                          if let error = PythonEngine.shared.prepare() {
-                              self.emit(.err, error + "\n")
-                          } else {
-                              PythonEngine.shared.run(code: code, fileName: fileName)
-                          }
-                      case .javascript:
-                          JSEngine.run(code: code, term: self, token: token)
-                      }
-                  }
-              }
-
-              private func runREPL(_ line: String, language: Language) {
-                  let token = beginRun(language: language)
-                  emit(.input, "\(language.prompt) \(line)\n")
-                  launch(token: token, silent: true) {
-                      switch language {
-                      case .python:
-                          if let error = PythonEngine.shared.prepare() {
-                              self.emit(.err, error + "\n")
-                          } else {
-                              PythonEngine.shared.repl(line)
-                          }
-                      case .javascript:
-                          JSEngine.repl(line, term: self, token: token)
-                      }
-                  }
-              }
-
-              private func runShell(_ line: String) {
-                  let token = beginRun(language: .javascript)
-                  emit(.input, "$ \(line)\n")
-                  launch(token: token, silent: false) {
-                      PackageManager.handle(line, term: self)
-                  }
-              }
-
-              private func launch(token: Int, silent: Bool, work: @escaping () -> Void) {
-                  let thread = Thread { [weak self] in
-                      work()
-                      DispatchQueue.main.async { self?.finish(token: token, silent: silent) }
-                  }
-                  thread.stackSize = 32 * 1024 * 1024
-                  thread.qualityOfService = .userInitiated
-                  thread.start()
-              }
-
-              func stop() {
-                  guard isRunning else { return }
-                  stopRequested = true
-                  if waitingForInput {
-                      waitingForInput = false
-                      lock.lock()
-                      inputValue = nil
-                      lock.unlock()
-                      inputSemaphore.signal()
-                  }
-                  if currentLanguage == .python {
-                      PythonEngine.shared.interrupt()
-                  } else {
-                      lock.lock()
-                      activeToken += 1
-                      lock.unlock()
-                      isRunning = false
-                      stopRequested = false
-                      emit(.info, "\n■ Stopped\n")
-                  }
-              }
-
-              // MARK: Input
-
-              /// Called from the worker thread. Blocks until the user submits a line (or stop is pressed).
-              func readInput(prompt: String) -> String? {
-                  if !prompt.isEmpty { emit(.out, prompt) }
-                  DispatchQueue.main.async { self.waitingForInput = true }
-                  inputSemaphore.wait()
-                  lock.lock()
-                  let value = inputValue
-                  inputValue = nil
-                  lock.unlock()
-                  return value
-              }
-
-              func submit(_ text: String, language: Language) {
-                  if waitingForInput {
-                      waitingForInput = false
-                      emit(.input, text + "\n")
-                      lock.lock()
-                      inputValue = text
-                      lock.unlock()
-                      inputSemaphore.signal()
-                  } else if !isRunning {
-                      let trimmed = text.trimmingCharacters(in: .whitespaces)
-                      if trimmed.isEmpty { return }
-                      if trimmed == "clear" || trimmed == "cls" {
-                          clear()
-                          return
-                      }
-                      if PackageManager.isCommand(trimmed) {
-                          runShell(trimmed)
-                          return
-                      }
-                      runREPL(text, language: language)
-                  }
-              }
-          }
-
-          // MARK: - Python
-
-          private let pyOutCallback: ide_out_cb = { stream, text in
-              guard let text = text else { return }
-              Terminal.shared.emit(stream == 2 ? .err : .out, String(cString: text))
-          }
-
-          private let pyInCallback: ide_in_cb = { prompt in
-              let p = prompt.map { String(cString: $0) } ?? ""
-              guard let line = Terminal.shared.readInput(prompt: p) else { return nil }
-              return strdup(line)
-          }
-
-          final class PythonEngine {
-              static let shared = PythonEngine()
-              private let lock = NSLock()
-              private var initialized = false
-              private var failure: String?
-
-              /// Starts the interpreter once. Returns an error message on failure.
-              func prepare() -> String? {
-                  lock.lock()
-                  defer { lock.unlock() }
-                  if initialized { return nil }
-                  if let f = failure { return f }
-
-                  let bundle = Bundle.main.bundlePath
-                  let libRoot = bundle + "/python/lib"
-                  let entries = (try? FileManager.default.contentsOfDirectory(atPath: libRoot)) ?? []
-                  guard let version = entries.first(where: { $0.hasPrefix("python3") }) else {
-                      failure = "Python runtime was not found inside the app (python/lib is missing)."
-                      return failure
-                  }
-                  let libdir = libRoot + "/" + version
-                  let exe = Bundle.main.executablePath ?? (bundle + "/CodeIDE")
-                  var errBuf = [CChar](repeating: 0, count: 1024)
-                  let cap = Int32(errBuf.count)
-                  let rc = ide_py_init(bundle + "/python", exe, libdir, PythonEngine.bootstrap(stdlib: libdir),
-                                       pyOutCallback, pyInCallback, &errBuf, cap)
-                  if rc != 0 {
-                      failure = "Python failed to start (code \(rc)): " + String(cString: errBuf)
-                      return failure
-                  }
-                  initialized = true
-                  return nil
-              }
-
-              func run(code: String, fileName: String) { ide_py_run(code, fileName) }
-              func repl(_ line: String) { ide_py_repl(line) }
-              func interrupt() { ide_py_interrupt() }
-
-              static func bootstrap(stdlib: String) -> String {
-                  let projects = ProjectStore.directory.path
-                  let site = PackageManager.sitePackages.path
-                  return #"""
-          import sys, os, builtins, traceback, linecache, importlib
-          import _ide_bridge
-
-          os.environ.setdefault("FORCE_COLOR", "1")
-          os.environ.setdefault("COLORTERM", "truecolor")
-          os.environ.setdefault("TERM", "xterm-256color")
-          os.environ.setdefault("COLUMNS", "60")
-          os.environ.setdefault("PYTHONIOENCODING", "utf-8")
-
-          PROJECTS = r"\#(projects)"
-          try:
-              os.makedirs(PROJECTS, exist_ok=True)
-              os.chdir(PROJECTS)
-          except Exception:
-              pass
-          if PROJECTS not in sys.path:
-              sys.path.insert(0, PROJECTS)
-          SITE = r"\#(site)"
-          for _p in (SITE, os.path.join(r"\#(stdlib)", "site-packages")):
-              if _p not in sys.path:
-                  sys.path.append(_p)
-
-
-          class _Out:
-              encoding = "utf-8"
-              errors = "replace"
-
-              def __init__(self, stream):
-                  self.stream = stream
-
-              def write(self, text):
-                  text = str(text).replace("\x00", "")
-                  _ide_bridge.write(self.stream, text.encode("utf-8", "replace").decode("utf-8"))
-                  return len(text)
-
-              def flush(self):
-                  pass
-
-              def isatty(self):
-                  return False
-
-              def writable(self):
-                  return True
-
-              def fileno(self):
-                  raise OSError("no fileno")
-
-
-          class _In:
-              encoding = "utf-8"
-
-              def readline(self, size=-1):
-                  try:
-                      return _ide_bridge.read("") + "\n"
-                  except EOFError:
-                      return ""
-
-              def read(self, size=-1):
-                  data = ""
-                  while True:
-                      line = self.readline()
-                      if not line:
-                          break
-                      data += line
-                  return data
-
-              def isatty(self):
-                  return False
-
-              def __iter__(self):
-                  return self
-
-              def __next__(self):
-                  line = self.readline()
-                  if not line:
-                      raise StopIteration
-                  return line
-
-
-          sys.stdout = _Out(1)
-          sys.stderr = _Out(2)
-          sys.stdin = _In()
-
-
-          def _input(prompt=""):
-              return _ide_bridge.read(str(prompt))
-
-
-          builtins.input = _input
-
-
-          def _report():
-              etype, value, tb = sys.exc_info()
-              if tb is not None and tb.tb_next is not None:
-                  tb = tb.tb_next
-              traceback.print_exception(etype, value, tb)
-
-
-          def _ide_run(code, name):
-              importlib.invalidate_caches()
-              linecache.cache[name] = (len(code), None, code.splitlines(True), name)
-              scope = {"__name__": "__main__", "__file__": name, "__builtins__": builtins}
-              try:
-                  exec(compile(code, name, "exec"), scope)
-              except SystemExit:
-                  pass
-              except BaseException:
-                  _report()
-
-
-          _repl_scope = {"__name__": "__main__", "__builtins__": builtins}
-
-
-          def _ide_repl(line):
-              importlib.invalidate_caches()
-              try:
-                  exec(compile(line, "<stdin>", "single"), _repl_scope)
-              except SystemExit:
-                  pass
-              except BaseException:
-                  _report()
-          """#
-              }
-          }
-
-          // MARK: - JavaScript
-
-          enum JSEngine {
-              private static var replContext: JSContext?
-
-              private static let prelude = #"""
-          function __fmt(v) {
-            if (typeof v === 'string') return v;
-            if (v === undefined) return 'undefined';
-            if (v === null) return 'null';
-            if (typeof v === 'function') return '[Function: ' + (v.name || 'anonymous') + ']';
-            if (typeof v === 'symbol') return v.toString();
-            if (v instanceof Error) return v.stack ? (v.name + ': ' + v.message + '\n' + v.stack) : String(v);
-            if (typeof v === 'object') {
-              try {
-                var rep = function (k, x) { return typeof x === 'function' ? '[Function]' : x; };
-                var compact = JSON.stringify(v, rep);
-                if (compact !== undefined && compact.length <= 72) return compact;
-                return JSON.stringify(v, rep, 2);
-              } catch (e) { return String(v); }
-            }
-            return String(v);
-          }
-          function __mk(kind) {
-            return function () {
-              var parts = [];
-              for (var i = 0; i < arguments.length; i++) parts.push(__fmt(arguments[i]));
-              __write(kind, parts.join(' ') + '\n');
-            };
-          }
-          var console = { log: __mk('out'), info: __mk('out'), debug: __mk('out'), error: __mk('err'), warn: __mk('err'), trace: __mk('err') };
-          console.table = function (x) { console.log(x); };
-          function alert(m) { __write('out', String(m) + '\n'); }
-          function prompt(m) { return __prompt(m === undefined ? '' : String(m)); }
-          var process = { argv: [], env: {}, platform: 'ios', stdout: { write: function (s) { __write('out', String(s)); } } };
-          var __timers = [], __tid = 0;
-          function __add(fn, ms, every, args) {
-            var id = ++__tid;
-            __timers.push({ id: id, fn: fn, at: Date.now() + Math.max(0, ms || 0), every: every, args: args });
-            return id;
-          }
-          function setTimeout(fn, ms) { return __add(fn, ms, undefined, Array.prototype.slice.call(arguments, 2)); }
-          function setInterval(fn, ms) { return __add(fn, ms, Math.max(1, ms || 0), Array.prototype.slice.call(arguments, 2)); }
-          function setImmediate(fn) { return __add(fn, 0, undefined, Array.prototype.slice.call(arguments, 1)); }
-          function clearTimeout(id) { __timers = __timers.filter(function (t) { return t.id !== id; }); }
-          var clearInterval = clearTimeout;
-          function __minIndex() {
-            var m = 0;
-            for (var i = 1; i < __timers.length; i++) { if (__timers[i].at < __timers[m].at) m = i; }
-            return m;
-          }
-          function __next() {
-            if (__timers.length === 0) return -1;
-            return Math.max(0, __timers[__minIndex()].at - Date.now());
-          }
-          function __fire() {
-            if (__timers.length === 0) return;
-            var t = __timers.splice(__minIndex(), 1)[0];
-            if (t.every !== undefined) { t.at = Date.now() + t.every; __timers.push(t); }
-            try { t.fn.apply(null, t.args); } catch (e) { __write('err', 'Uncaught ' + String(e) + '\n'); }
-          }
-          var global = this;
-          var module = { exports: {} };
-          var exports = module.exports;
-          process.nextTick = function (fn) { var a = Array.prototype.slice.call(arguments, 1); setTimeout(function () { fn.apply(null, a); }, 0); };
-          var __NM = "__NM_PATH__";
-          var __modCache = {};
-          var __builtinCache = {};
-          var __builtins = {
-            events: function () {
-              function EventEmitter() { this._ev = {}; }
-              EventEmitter.prototype.on = function (n, f) { (this._ev[n] = this._ev[n] || []).push(f); return this; };
-              EventEmitter.prototype.addListener = EventEmitter.prototype.on;
-              EventEmitter.prototype.off = function (n, f) { this._ev[n] = (this._ev[n] || []).filter(function (x) { return x !== f; }); return this; };
-              EventEmitter.prototype.removeListener = EventEmitter.prototype.off;
-              EventEmitter.prototype.once = function (n, f) { var self = this; function w() { self.off(n, w); f.apply(self, arguments); } return this.on(n, w); };
-              EventEmitter.prototype.emit = function (n) { var a = Array.prototype.slice.call(arguments, 1); var l = (this._ev[n] || []).slice(); for (var i = 0; i < l.length; i++) l[i].apply(this, a); return l.length > 0; };
-              EventEmitter.EventEmitter = EventEmitter;
-              return EventEmitter;
-            },
-            util: function () {
-              return {
-                inspect: __fmt,
-                format: function () { return Array.prototype.map.call(arguments, __fmt).join(' '); },
-                inherits: function (c, s) { c.prototype = Object.create(s.prototype); c.prototype.constructor = c; }
-              };
-            }
-          };
-          function __dirnameOf(p) { var i = p.lastIndexOf('/'); return i <= 0 ? '/' : p.slice(0, i); }
-          function __norm(p) {
-            var out = [], parts = p.split('/');
-            for (var i = 0; i < parts.length; i++) {
-              var s = parts[i];
-              if (s === '' || s === '.') continue;
-              if (s === '..') out.pop(); else out.push(s);
-            }
-            return '/' + out.join('/');
-          }
-          function __tryFile(p) {
-            var c = [p, p + '.js', p + '.json', p + '/index.js'];
-            for (var i = 0; i < c.length; i++) { if (__isFile(c[i])) return c[i]; }
-            return null;
-          }
-          function __resolve(req, from) {
-            var first = req.charAt(0);
-            var base = (first === '.' || first === '/') ? __norm(first === '/' ? req : from + '/' + req) : __norm(__NM + '/' + req);
-            var r = __tryFile(base);
-            if (r) return r;
-            var pj = __readFile(base + '/package.json');
-            if (pj !== null) {
-              try {
-                var m = JSON.parse(pj).main;
-                if (m) { r = __tryFile(__norm(base + '/' + m)); if (r) return r; }
-              } catch (e) {}
-            }
-            return null;
-          }
-          function __makeRequire(from) {
-            return function (name) {
-              if (name.indexOf('node:') === 0) name = name.slice(5);
-              if (Object.prototype.hasOwnProperty.call(__builtins, name)) {
-                return __builtinCache[name] || (__builtinCache[name] = __builtins[name]());
-              }
-              var file = __resolve(name, from);
-              if (!file) throw new Error("Cannot find module '" + name + "'. Install it with: npm install " + name);
-              if (__modCache[file]) return __modCache[file].exports;
-              var mod = { exports: {}, id: file, filename: file };
-              __modCache[file] = mod;
-              var src = __readFile(file);
-              if (file.slice(-5) === '.json') { mod.exports = JSON.parse(src); return mod.exports; }
-              var dir = __dirnameOf(file);
-              var fn = new Function('exports', 'require', 'module', '__filename', '__dirname', src);
-              fn.call(mod.exports, mod.exports, __makeRequire(dir), mod, file, dir);
-              return mod.exports;
-            };
-          }
-          var require = __makeRequire("__PROJ_PATH__");
-          """#
-
-              private static func makeContext(term: Terminal, token: Int?) -> JSContext {
-                  let ctx = JSContext()!
-                  let alive: () -> Bool = {
-                      if let t = token { return term.isActive(t) }
-                      return true
-                  }
-                  ctx.exceptionHandler = { _, exc in
-                      guard alive() else { return }
-                      let message = exc?.toString() ?? "Error"
-                      var line = ""
-                      if let l = exc?.objectForKeyedSubscript("line"), l.isNumber {
-                          line = " (line \(Int(l.toInt32())))"
-                      }
-                      term.emit(.err, "Uncaught " + message + line + "\n")
-                  }
-                  let write: @convention(block) (String, String) -> Void = { kind, text in
-                      guard alive() else { return }
-                      term.emit(kind == "err" ? .err : .out, text)
-                  }
-                  ctx.setObject(write, forKeyedSubscript: "__write" as NSString)
-                  let ask: @convention(block) (String) -> Any = { message in
-                      guard alive() else { return NSNull() }
-                      let shown = message.isEmpty ? "" : message + " "
-                      if let answer = term.readInput(prompt: shown) { return answer }
-                      return NSNull()
-                  }
-                  ctx.setObject(ask, forKeyedSubscript: "__prompt" as NSString)
-                  let readFile: @convention(block) (String) -> Any = { path in
-                      if let text = try? String(contentsOfFile: path, encoding: .utf8) { return text }
-                      return NSNull()
-                  }
-                  ctx.setObject(readFile, forKeyedSubscript: "__readFile" as NSString)
-                  let isFile: @convention(block) (String) -> Bool = { path in
-                      var isDir: ObjCBool = false
-                      return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && !isDir.boolValue
-                  }
-                  ctx.setObject(isFile, forKeyedSubscript: "__isFile" as NSString)
-                  let source = prelude
-                      .replacingOccurrences(of: "__NM_PATH__", with: PackageManager.nodeModules.path)
-                      .replacingOccurrences(of: "__PROJ_PATH__", with: ProjectStore.directory.path)
-                  ctx.evaluateScript(source)
-                  return ctx
-              }
-
-              private static func pump(_ ctx: JSContext, term: Terminal, token: Int) {
-                  while term.isActive(token) {
-                      let delay = ctx.evaluateScript("__next()")?.toDouble() ?? -1
-                      if delay.isNaN || delay < 0 { break }
-                      if delay > 0 {
-                          Thread.sleep(forTimeInterval: min(delay, 100) / 1000.0)
-                          if delay > 100 { continue }
-                      }
-                      ctx.evaluateScript("__fire()")
-                  }
-              }
-
-              static func run(code: String, term: Terminal, token: Int) {
-                  let ctx = makeContext(term: term, token: token)
-                  ctx.evaluateScript(code)
-                  pump(ctx, term: term, token: token)
-              }
-
-              static func repl(_ line: String, term: Terminal, token: Int) {
-                  if replContext == nil { replContext = makeContext(term: term, token: nil) }
-                  guard let ctx = replContext else { return }
-                  if let result = ctx.evaluateScript(line), !result.isUndefined {
-                      var text = ""
-                      if result.isString {
-                          text = "'" + (result.toString() ?? "") + "'"
-                      } else if let f = ctx.objectForKeyedSubscript("__fmt"),
-                                let s = f.call(withArguments: [result])?.toString() {
-                          text = s
-                      }
-                      term.emit(.result, text + "\n")
-                  }
-                  pump(ctx, term: term, token: token)
-              }
-          }
-          CODEIDE_UPD_5
-          cat > Sources/Bridge/PyBridge.c <<'CODEIDE_UPD_6'
-          #include <Python/Python.h>
-          #include <stdio.h>
-          #include <stdlib.h>
-          #include <string.h>
-          #include "PyBridge.h"
-
-          static ide_out_cb g_out = NULL;
-          static ide_in_cb g_in = NULL;
-          static unsigned long g_run_thread = 0;
-          static PyObject *g_run_fn = NULL;
-          static PyObject *g_repl_fn = NULL;
-
-          static void set_err(char *err, int len, const char *msg) {
-              if (err && len > 0) {
-                  strncpy(err, msg ? msg : "unknown error", (size_t)(len - 1));
-                  err[len - 1] = 0;
-              }
-          }
-
-          static PyObject *bridge_write(PyObject *self, PyObject *args) {
-              int stream;
-              const char *text;
-              if (!PyArg_ParseTuple(args, "is", &stream, &text)) return NULL;
-              if (g_out) g_out(stream, text);
-              Py_RETURN_NONE;
-          }
-
-          static PyObject *bridge_read(PyObject *self, PyObject *args) {
-              const char *prompt;
-              if (!PyArg_ParseTuple(args, "s", &prompt)) return NULL;
-              char *line = NULL;
-              if (g_in) {
-                  Py_BEGIN_ALLOW_THREADS
-                  line = g_in(prompt);
-                  Py_END_ALLOW_THREADS
-              }
-              if (!line) {
-                  PyErr_SetNone(PyExc_EOFError);
-                  return NULL;
-              }
-              PyObject *result = PyUnicode_FromString(line);
-              free(line);
-              return result;
-          }
-
-          static PyMethodDef bridge_methods[] = {
-              {"write", bridge_write, METH_VARARGS, "write(stream, text)"},
-              {"read", bridge_read, METH_VARARGS, "read(prompt) -> str"},
-              {NULL, NULL, 0, NULL}
-          };
-
-          static struct PyModuleDef bridge_module = {
-              PyModuleDef_HEAD_INIT, "_ide_bridge", NULL, -1, bridge_methods
-          };
-
-          static PyObject *PyInit__ide_bridge(void) {
-              return PyModule_Create(&bridge_module);
-          }
-
-          int ide_py_init(const char *home, const char *executable, const char *libdir,
-                          const char *bootstrap, ide_out_cb out, ide_in_cb inp,
-                          char *err, int errlen) {
-              g_out = out;
-              g_in = inp;
-
-              PyStatus status;
-              PyPreConfig preconfig;
-              PyPreConfig_InitIsolatedConfig(&preconfig);
-              preconfig.utf8_mode = 1;
-              status = Py_PreInitialize(&preconfig);
-              if (PyStatus_Exception(status)) {
-                  set_err(err, errlen, status.err_msg);
-                  return -1;
-              }
-
-              if (PyImport_AppendInittab("_ide_bridge", PyInit__ide_bridge) == -1) {
-                  set_err(err, errlen, "could not register bridge module");
-                  return -2;
-              }
-
-              PyConfig config;
-              PyConfig_InitIsolatedConfig(&config);
-              config.write_bytecode = 0;
-              config.buffered_stdio = 0;
-              config.install_signal_handlers = 0;
-              config.parse_argv = 0;
-
-              status = PyConfig_SetBytesString(&config, &config.home, home);
-              if (PyStatus_Exception(status)) goto fail;
-              status = PyConfig_SetBytesString(&config, &config.executable, executable);
-              if (PyStatus_Exception(status)) goto fail;
-              status = PyConfig_SetBytesString(&config, &config.program_name, executable);
-              if (PyStatus_Exception(status)) goto fail;
-
-              config.module_search_paths_set = 1;
-              {
-                  char dyn[4096];
-                  snprintf(dyn, sizeof(dyn), "%s/lib-dynload", libdir);
-                  const char *paths[2] = { libdir, dyn };
-                  for (int i = 0; i < 2; i++) {
-                      wchar_t *w = Py_DecodeLocale(paths[i], NULL);
-                      if (!w) { set_err(err, errlen, "could not decode path"); PyConfig_Clear(&config); return -3; }
-                      status = PyWideStringList_Append(&config.module_search_paths, w);
-                      PyMem_RawFree(w);
-                      if (PyStatus_Exception(status)) goto fail;
-                  }
-              }
-
-              status = Py_InitializeFromConfig(&config);
-              if (PyStatus_Exception(status)) goto fail;
-              PyConfig_Clear(&config);
-
-              PyObject *main_mod = PyImport_AddModule("__main__");
-              PyObject *dict = main_mod ? PyModule_GetDict(main_mod) : NULL;
-              PyObject *res = dict ? PyRun_String(bootstrap, Py_file_input, dict, dict) : NULL;
-              if (!res) {
-                  char buf[600];
-                  const char *tname = "error";
-                  const char *msg = NULL;
-                  PyObject *t = NULL, *v = NULL, *tb = NULL, *str = NULL;
-                  PyErr_Fetch(&t, &v, &tb);
-                  PyErr_NormalizeException(&t, &v, &tb);
-                  if (t) tname = ((PyTypeObject *)t)->tp_name;
-                  if (v) str = PyObject_Str(v);
-                  if (str) msg = PyUnicode_AsUTF8(str);
-                  snprintf(buf, sizeof(buf), "bootstrap script failed: %s: %s", tname, msg ? msg : "(no message)");
-                  set_err(err, errlen, buf);
-                  PyErr_Clear();
-                  return -4;
-              }
-              Py_DECREF(res);
-
-              g_run_fn = dict ? PyDict_GetItemString(dict, "_ide_run") : NULL;
-              g_repl_fn = dict ? PyDict_GetItemString(dict, "_ide_repl") : NULL;
-              if (!g_run_fn || !g_repl_fn) {
-                  set_err(err, errlen, "runner functions missing");
-                  return -5;
-              }
-              Py_INCREF(g_run_fn);
-              Py_INCREF(g_repl_fn);
-
-              PyEval_SaveThread();
-              return 0;
-
-          fail:
-              set_err(err, errlen, status.err_msg);
-              PyConfig_Clear(&config);
-              return -6;
-          }
-
-          void ide_py_run(const char *code, const char *name) {
-              PyGILState_STATE st = PyGILState_Ensure();
-              g_run_thread = PyThread_get_thread_ident();
-              PyObject *r = PyObject_CallFunction(g_run_fn, "ss", code, name);
-              if (!r) PyErr_Print(); else Py_DECREF(r);
-              g_run_thread = 0;
-              PyGILState_Release(st);
-          }
-
-          void ide_py_repl(const char *line) {
-              PyGILState_STATE st = PyGILState_Ensure();
-              g_run_thread = PyThread_get_thread_ident();
-              PyObject *r = PyObject_CallFunction(g_repl_fn, "s", line);
-              if (!r) PyErr_Print(); else Py_DECREF(r);
-              g_run_thread = 0;
-              PyGILState_Release(st);
-          }
-
-          void ide_py_interrupt(void) {
-              unsigned long t = g_run_thread;
-              if (!t) return;
-              PyGILState_STATE st = PyGILState_Ensure();
-              PyThreadState_SetAsyncExc(t, PyExc_KeyboardInterrupt);
-              PyGILState_Release(st);
-          }
-          CODEIDE_UPD_6
+          CODEIDE_UPD_3
           if [ ! -f requirements-ios.txt ]; then
           printf '# One package per line (for example: numpy). They are compiled into the app at build time.\n# Only packages that publish iOS wheels will work.\n' > requirements-ios.txt
           fi
-          touch .update-ui-v3
+          touch .update-fstring-v4
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "New VS Code style UI and editor features"
+          git commit -m "f-string highlighting and themed symbol bar"
           git push origin HEAD
           fi
 
