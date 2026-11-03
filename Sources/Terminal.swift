@@ -10,6 +10,8 @@ final class Terminal: ObservableObject {
     struct Seg {
         var kind: Kind
         var text: String
+        var fg: UInt32? = nil
+        var bold: Bool = false
     }
 
     @Published private(set) var segs: [Seg] = []
@@ -21,6 +23,27 @@ final class Terminal: ObservableObject {
     private var pending: [Seg] = []
     private var flushScheduled = false
     private var totalChars = 0
+    private var buf: [Seg] = []
+    private var ansiFG: UInt32?
+    private var ansiBold = false
+    private var ansiCarry = ""
+
+    private static let palette: [UInt32] = [
+        0x666666, 0xCD3131, 0x0DBC79, 0xE5E510, 0x2472C8, 0xBC3FBC, 0x11A8CD, 0xE5E5E5,
+        0x808080, 0xF14C4C, 0x23D18B, 0xF5F543, 0x3B8EEA, 0xD670D6, 0x29B8DB, 0xFFFFFF
+    ]
+
+    private static func color256(_ n: Int) -> UInt32 {
+        if n < 0 { return palette[7] }
+        if n < 16 { return palette[n] }
+        if n < 232 {
+            let v = n - 16
+            let levels: [UInt32] = [0, 95, 135, 175, 215, 255]
+            return (levels[v / 36] << 16) | (levels[(v / 6) % 6] << 8) | levels[v % 6]
+        }
+        let g = UInt32(min(255, 8 + 10 * (n - 232)))
+        return (g << 16) | (g << 8) | g
+    }
     private var activeToken = 0
     private var inputValue: String?
     private let inputSemaphore = DispatchSemaphore(value: 0)
@@ -50,31 +73,175 @@ final class Terminal: ObservableObject {
         pending = []
         flushScheduled = false
         lock.unlock()
-        for s in items {
-            if let last = segs.last, last.kind == s.kind {
-                segs[segs.count - 1].text += s.text
+        for item in items {
+            if item.kind == .out || item.kind == .err {
+                appendParsed(item.kind, item.text)
             } else {
-                segs.append(s)
+                push(item.kind, item.text, fg: nil, bold: false)
             }
-            totalChars += s.text.count
         }
-        while totalChars > 120_000 && segs.count > 1 {
-            totalChars -= segs[0].text.count
-            segs.removeFirst()
+        while totalChars > 120_000 && buf.count > 1 {
+            totalChars -= buf[0].text.count
+            buf.removeFirst()
         }
-        if segs.count == 1 && totalChars > 120_000 {
-            segs[0].text = String(segs[0].text.suffix(100_000))
-            totalChars = segs[0].text.count
+        if buf.count == 1 && totalChars > 120_000 {
+            buf[0].text = String(buf[0].text.suffix(100_000))
+            totalChars = buf[0].text.count
         }
+        segs = buf
         version += 1
+    }
+
+    private func push(_ kind: Kind, _ text: String, fg: UInt32?, bold: Bool) {
+        if text.isEmpty { return }
+        totalChars += text.count
+        if let last = buf.last, last.kind == kind, last.fg == fg, last.bold == bold {
+            buf[buf.count - 1].text += text
+        } else {
+            buf.append(Seg(kind: kind, text: text, fg: fg, bold: bold))
+        }
+    }
+
+    private func eraseCurrentLine() {
+        while let last = buf.last {
+            if let nl = last.text.lastIndex(of: "\n") {
+                let keep = String(last.text[...nl])
+                totalChars -= last.text.count - keep.count
+                buf[buf.count - 1].text = keep
+                return
+            }
+            totalChars -= last.text.count
+            buf.removeLast()
+        }
+    }
+
+    private func applySGR(_ params: String) {
+        let codes = params.split(separator: ";", omittingEmptySubsequences: false).map { Int($0) ?? 0 }
+        if codes.isEmpty {
+            ansiFG = nil
+            ansiBold = false
+            return
+        }
+        var k = 0
+        while k < codes.count {
+            let c = codes[k]
+            switch c {
+            case 0:
+                ansiFG = nil
+                ansiBold = false
+            case 1:
+                ansiBold = true
+            case 22:
+                ansiBold = false
+            case 30...37:
+                ansiFG = Terminal.palette[c - 30]
+            case 39:
+                ansiFG = nil
+            case 90...97:
+                ansiFG = Terminal.palette[c - 90 + 8]
+            case 38, 48:
+                if k + 2 < codes.count && codes[k + 1] == 5 {
+                    if c == 38 { ansiFG = Terminal.color256(codes[k + 2]) }
+                    k += 2
+                } else if k + 4 < codes.count && codes[k + 1] == 2 {
+                    if c == 38 {
+                        let r = UInt32(max(0, min(255, codes[k + 2])))
+                        let g = UInt32(max(0, min(255, codes[k + 3])))
+                        let b = UInt32(max(0, min(255, codes[k + 4])))
+                        ansiFG = (r << 16) | (g << 8) | b
+                    }
+                    k += 4
+                }
+            default:
+                break
+            }
+            k += 1
+        }
+    }
+
+    /// Splits terminal output into colored segments (ANSI colors) and handles carriage returns.
+    private func appendParsed(_ kind: Kind, _ raw: String) {
+        let text = (ansiCarry + raw).replacingOccurrences(of: "\r\n", with: "\n")
+        ansiCarry = ""
+        let chars = Array(text.unicodeScalars)
+        var buffer = ""
+        var i = 0
+        while i < chars.count {
+            let c = chars[i]
+            if c == "\u{1B}" {
+                if i + 1 >= chars.count {
+                    ansiCarry = "\u{1B}"
+                    break
+                }
+                let kindChar = chars[i + 1]
+                if kindChar == "[" {
+                    var j = i + 2
+                    var params = ""
+                    while j < chars.count && chars[j].value >= 0x30 && chars[j].value <= 0x3F {
+                        params.unicodeScalars.append(chars[j])
+                        j += 1
+                    }
+                    while j < chars.count && chars[j].value >= 0x20 && chars[j].value <= 0x2F {
+                        j += 1
+                    }
+                    if j >= chars.count {
+                        var rest = String.UnicodeScalarView()
+                        rest.append(contentsOf: chars[i...])
+                        ansiCarry = String(rest)
+                        break
+                    }
+                    push(kind, buffer, fg: ansiFG, bold: ansiBold)
+                    buffer = ""
+                    if chars[j] == "m" { applySGR(params) }
+                    i = j + 1
+                    continue
+                } else if kindChar == "]" {
+                    var j = i + 2
+                    while j < chars.count {
+                        if chars[j].value == 7 {
+                            j += 1
+                            break
+                        }
+                        if chars[j] == "\u{1B}" && j + 1 < chars.count && chars[j + 1] == "\\" {
+                            j += 2
+                            break
+                        }
+                        j += 1
+                    }
+                    i = j
+                    continue
+                } else {
+                    i += 2
+                    continue
+                }
+            }
+            if c == "\r" {
+                push(kind, buffer, fg: ansiFG, bold: ansiBold)
+                buffer = ""
+                eraseCurrentLine()
+                i += 1
+                continue
+            }
+            buffer.unicodeScalars.append(c)
+            i += 1
+        }
+        push(kind, buffer, fg: ansiFG, bold: ansiBold)
+    }
+
+    func plainText() -> String {
+        buf.map { $0.text }.joined()
     }
 
     func clear() {
         lock.lock()
         pending = []
         lock.unlock()
+        buf = []
         segs = []
         totalChars = 0
+        ansiFG = nil
+        ansiBold = false
+        ansiCarry = ""
         version += 1
     }
 
@@ -102,6 +269,8 @@ final class Terminal: ObservableObject {
         guard isActive(token) else { return }
         isRunning = false
         waitingForInput = false
+        ansiFG = nil
+        ansiBold = false
         if stopRequested {
             emit(.info, "\n■ Stopped\n")
         } else if !silent {
@@ -280,6 +449,12 @@ final class PythonEngine {
         return #"""
 import sys, os, builtins, traceback, linecache, importlib
 import _ide_bridge
+
+os.environ.setdefault("FORCE_COLOR", "1")
+os.environ.setdefault("COLORTERM", "truecolor")
+os.environ.setdefault("TERM", "xterm-256color")
+os.environ.setdefault("COLUMNS", "60")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 PROJECTS = r"\#(projects)"
 try:

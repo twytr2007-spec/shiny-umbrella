@@ -115,6 +115,7 @@ final class ProjectStore: ObservableObject {
 
     @Published var files: [CodeFile] = []
     @Published var currentName: String = ""
+    @Published var openTabs: [String] = []
     private var pendingSaves: [String: DispatchWorkItem] = [:]
 
     init() {
@@ -123,9 +124,9 @@ final class ProjectStore: ObservableObject {
             create(baseName: "main", language: .javascript, content: Templates.list(for: .javascript)[0].code)
             create(baseName: "main", language: .python, content: Templates.list(for: .python)[0].code)
         }
-        if !files.contains(where: { $0.name == currentName }) {
-            currentName = files.first(where: { $0.name == "main.py" })?.name ?? files[0].name
-        }
+        let start = files.first(where: { $0.name == "main.py" })?.name ?? files[0].name
+        currentName = start
+        openTabs = [start]
     }
 
     var current: CodeFile? { files.first(where: { $0.name == currentName }) }
@@ -145,15 +146,40 @@ final class ProjectStore: ObservableObject {
             }
     }
 
-    @discardableResult
-    func create(baseName: String, language: Language, content: String) -> String {
+    // MARK: Tabs
+
+    func open(_ name: String) {
+        guard files.contains(where: { $0.name == name }) else { return }
+        if name != currentName { saveNow(currentName) }
+        if !openTabs.contains(name) { openTabs.append(name) }
+        currentName = name
+    }
+
+    func closeTab(_ name: String) {
+        guard openTabs.count > 1, let i = openTabs.firstIndex(of: name) else { return }
+        saveNow(name)
+        openTabs.remove(at: i)
+        if currentName == name {
+            currentName = openTabs[min(i, openTabs.count - 1)]
+        }
+    }
+
+    // MARK: Files
+
+    private static func cleanBase(_ baseName: String, ext: String) -> String {
         var base = baseName.trimmingCharacters(in: .whitespacesAndNewlines)
         let bad = CharacterSet(charactersIn: "/\\:*?\"<>|")
         base = base.components(separatedBy: bad).joined(separator: "_")
-        if base.isEmpty { base = "script" }
-        if base.lowercased().hasSuffix("." + language.ext) {
-            base = String(base.dropLast(language.ext.count + 1))
+        if base.lowercased().hasSuffix("." + ext) {
+            base = String(base.dropLast(ext.count + 1))
         }
+        return base
+    }
+
+    @discardableResult
+    func create(baseName: String, language: Language, content: String) -> String {
+        var base = Self.cleanBase(baseName, ext: language.ext)
+        if base.isEmpty { base = "script" }
         var name = "\(base).\(language.ext)"
         var i = 2
         while files.contains(where: { $0.name == name }) {
@@ -163,8 +189,44 @@ final class ProjectStore: ObservableObject {
         files.append(CodeFile(name: name, content: content))
         files.sort { $0.name < $1.name }
         try? content.write(to: url(for: name), atomically: true, encoding: .utf8)
+        if !currentName.isEmpty { saveNow(currentName) }
+        if !openTabs.contains(name) { openTabs.append(name) }
         currentName = name
         return name
+    }
+
+    func rename(_ old: String, to newBase: String) {
+        guard let i = files.firstIndex(where: { $0.name == old }) else { return }
+        saveNow(old)
+        let ext = files[i].language.ext
+        let base = Self.cleanBase(newBase, ext: ext)
+        if base.isEmpty { return }
+        let newName = "\(base).\(ext)"
+        if newName == old || files.contains(where: { $0.name == newName }) { return }
+        do {
+            try FileManager.default.moveItem(at: url(for: old), to: url(for: newName))
+        } catch {
+            return
+        }
+        files[i].name = newName
+        files.sort { $0.name < $1.name }
+        openTabs = openTabs.map { $0 == old ? newName : $0 }
+        if currentName == old { currentName = newName }
+    }
+
+    func duplicate(_ name: String) {
+        guard let f = files.first(where: { $0.name == name }) else { return }
+        saveNow(name)
+        let base = (name as NSString).deletingPathExtension + "_copy"
+        create(baseName: base, language: f.language, content: f.content)
+    }
+
+    func importFile(_ fileURL: URL) {
+        let access = fileURL.startAccessingSecurityScopedResource()
+        defer { if access { fileURL.stopAccessingSecurityScopedResource() } }
+        guard let text = try? String(contentsOf: fileURL, encoding: .utf8) else { return }
+        let language: Language = fileURL.pathExtension.lowercased() == "js" ? .javascript : .python
+        create(baseName: fileURL.deletingPathExtension().lastPathComponent, language: language, content: text)
     }
 
     func updateCurrent(_ text: String) {
@@ -188,13 +250,19 @@ final class ProjectStore: ObservableObject {
         try? f.content.write(to: url(for: name), atomically: true, encoding: .utf8)
     }
 
+    func saveAll() {
+        for f in files { saveNow(f.name) }
+    }
+
     func delete(_ name: String) {
         try? FileManager.default.removeItem(at: url(for: name))
         files.removeAll(where: { $0.name == name })
+        openTabs.removeAll(where: { $0 == name })
         if files.isEmpty {
             create(baseName: "main", language: .python, content: Templates.list(for: .python)[0].code)
-        } else if currentName == name {
-            currentName = files[0].name
+        } else {
+            if openTabs.isEmpty { openTabs = [files[0].name] }
+            if currentName == name { currentName = openTabs[0] }
         }
     }
 }

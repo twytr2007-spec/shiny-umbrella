@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct TerminalView: View {
     @ObservedObject var term: Terminal
@@ -8,10 +9,13 @@ struct TerminalView: View {
     @Binding var mode: Int   // 0 = collapsed, 1 = normal, 2 = large
 
     @State private var input = ""
+    @State private var history: [String] = []
+    @State private var historyIndex = 0
     @FocusState private var focused: Bool
 
-    private func color(for kind: Terminal.Kind) -> Color {
-        switch kind {
+    private func color(for seg: Terminal.Seg) -> Color {
+        if let fg = seg.fg { return Color(hex: fg) }
+        switch seg.kind {
         case .out: return theme.textColor
         case .err: return theme.errorColor
         case .input: return theme.accentColor
@@ -38,25 +42,35 @@ struct TerminalView: View {
                         proxy.scrollTo("end", anchor: .bottom)
                     }
                 }
-                Divider()
+                Rectangle().fill(theme.borderColor).frame(height: 1)
                 inputBar
             }
         }
-        .background(theme.panelColor)
+        .background(theme.bgColor)
     }
 
     private var header: some View {
-        HStack(spacing: 14) {
-            Circle()
-                .fill(term.isRunning ? Color.green : theme.commentColor.opacity(0.6))
-                .frame(width: 9, height: 9)
-            Text("TERMINAL · \(language.title)")
-                .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                .foregroundColor(theme.commentColor)
-            Spacer()
-            Button { term.clear() } label: {
-                Image(systemName: "trash")
+        HStack(spacing: 16) {
+            VStack(spacing: 0) {
+                Text("TERMINAL")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(theme.textColor)
+                    .padding(.top, 11)
+                    .padding(.bottom, 8)
+                Rectangle().fill(theme.accentColor).frame(height: 1.5)
             }
+            .fixedSize()
+            Text(language.title)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(theme.commentColor)
+            if term.isRunning {
+                ProgressView().scaleEffect(0.6)
+            }
+            Spacer()
+            Button {
+                UIPasteboard.general.string = term.plainText()
+            } label: { Image(systemName: "doc.on.doc") }
+            Button { term.clear() } label: { Image(systemName: "trash") }
             Button { mode = (mode == 2) ? 1 : 2 } label: {
                 Image(systemName: mode == 2 ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
             }
@@ -64,20 +78,22 @@ struct TerminalView: View {
                 Image(systemName: mode == 0 ? "chevron.up" : "chevron.down")
             }
         }
-        .font(.system(size: 15))
+        .font(.system(size: 14))
         .foregroundColor(theme.commentColor)
         .padding(.horizontal, 12)
-        .frame(height: 40)
+        .frame(height: 38)
         .background(theme.panelColor)
     }
 
     private var output: some View {
         let combined = term.segs.reduce(Text("")) { (acc: Text, seg: Terminal.Seg) -> Text in
-            acc + Text(seg.text).foregroundColor(color(for: seg.kind))
+            var piece = Text(seg.text).foregroundColor(color(for: seg))
+            if seg.bold { piece = piece.bold() }
+            return acc + piece
         }
         return Group {
             if term.segs.isEmpty {
-                Text("Press ▶ to run your code, or type a command below.")
+                Text("Press Run to execute your code, or type a command below.")
                     .foregroundColor(theme.commentColor)
             } else {
                 combined
@@ -97,8 +113,10 @@ struct TerminalView: View {
     private var placeholder: String {
         if term.waitingForInput { return "Type input and press return" }
         if term.isRunning { return "Running…" }
-        return "Type a \(language.title) command"
+        return "\(language.title) command, or: pip install / npm install"
     }
+
+    private var inputDisabled: Bool { term.isRunning && !term.waitingForInput }
 
     private var inputBar: some View {
         HStack(spacing: 8) {
@@ -112,24 +130,40 @@ struct TerminalView: View {
                 .autocorrectionDisabled(true)
                 .submitLabel(.send)
                 .focused($focused)
-                .disabled(term.isRunning && !term.waitingForInput)
+                .disabled(inputDisabled)
                 .onSubmit { send() }
+            Button { stepHistory(-1) } label: { Image(systemName: "chevron.up") }
+                .disabled(history.isEmpty || inputDisabled)
+            Button { stepHistory(1) } label: { Image(systemName: "chevron.down") }
+                .disabled(history.isEmpty || inputDisabled)
             Button { send() } label: {
-                Image(systemName: "return")
-                    .foregroundColor(theme.accentColor)
+                Image(systemName: "return").foregroundColor(theme.accentColor)
             }
-            .disabled(term.isRunning && !term.waitingForInput)
+            .disabled(inputDisabled)
         }
+        .font(.system(size: 14))
+        .foregroundColor(theme.commentColor)
         .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.vertical, 9)
+        .background(theme.panelColor)
         .onChange(of: term.waitingForInput) { waiting in
             if waiting { focused = true }
         }
     }
 
+    private func stepHistory(_ delta: Int) {
+        guard !history.isEmpty else { return }
+        historyIndex = max(0, min(history.count, historyIndex + delta))
+        input = historyIndex < history.count ? history[historyIndex] : ""
+    }
+
     private func send() {
         let text = input
         input = ""
+        if !term.waitingForInput, !text.trimmingCharacters(in: .whitespaces).isEmpty {
+            history.append(text)
+        }
+        historyIndex = history.count
         term.submit(text, language: language)
         focused = true
     }
