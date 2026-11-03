@@ -1,0 +1,2 @@
+# One package per line (for example: numpy). They are compiled into the app at build time.
+# Only packages that publish iOS wheels will work.

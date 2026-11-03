@@ -145,6 +145,14 @@ final class Terminal: ObservableObject {
         }
     }
 
+    private func runShell(_ line: String) {
+        let token = beginRun(language: .javascript)
+        emit(.input, "$ \(line)\n")
+        launch(token: token, silent: false) {
+            PackageManager.handle(line, term: self)
+        }
+    }
+
     private func launch(token: Int, silent: Bool, work: @escaping () -> Void) {
         let thread = Thread { [weak self] in
             work()
@@ -206,6 +214,10 @@ final class Terminal: ObservableObject {
                 clear()
                 return
             }
+            if PackageManager.isCommand(trimmed) {
+                runShell(trimmed)
+                return
+            }
             runREPL(text, language: language)
         }
     }
@@ -264,8 +276,9 @@ final class PythonEngine {
 
     static func bootstrap() -> String {
         let projects = ProjectStore.directory.path
+        let site = PackageManager.sitePackages.path
         return #"""
-import sys, os, builtins, traceback, linecache
+import sys, os, builtins, traceback, linecache, importlib
 import _ide_bridge
 
 PROJECTS = r"\#(projects)"
@@ -276,6 +289,10 @@ except Exception:
     pass
 if PROJECTS not in sys.path:
     sys.path.insert(0, PROJECTS)
+SITE = r"\#(site)"
+for _p in (SITE, os.path.join(os.path.dirname(os.__file__), "site-packages")):
+    if _p not in sys.path:
+        sys.path.append(_p)
 
 
 class _Out:
@@ -354,6 +371,7 @@ def _report():
 
 
 def _ide_run(code, name):
+    importlib.invalidate_caches()
     linecache.cache[name] = (len(code), None, code.splitlines(True), name)
     scope = {"__name__": "__main__", "__file__": name, "__builtins__": builtins}
     try:
@@ -368,6 +386,7 @@ _repl_scope = {"__name__": "__main__", "__builtins__": builtins}
 
 
 def _ide_repl(line):
+    importlib.invalidate_caches()
     try:
         exec(compile(line, "<stdin>", "single"), _repl_scope)
     except SystemExit:
@@ -439,6 +458,82 @@ function __fire() {
   if (t.every !== undefined) { t.at = Date.now() + t.every; __timers.push(t); }
   try { t.fn.apply(null, t.args); } catch (e) { __write('err', 'Uncaught ' + String(e) + '\n'); }
 }
+var global = this;
+var module = { exports: {} };
+var exports = module.exports;
+process.nextTick = function (fn) { var a = Array.prototype.slice.call(arguments, 1); setTimeout(function () { fn.apply(null, a); }, 0); };
+var __NM = "__NM_PATH__";
+var __modCache = {};
+var __builtinCache = {};
+var __builtins = {
+  events: function () {
+    function EventEmitter() { this._ev = {}; }
+    EventEmitter.prototype.on = function (n, f) { (this._ev[n] = this._ev[n] || []).push(f); return this; };
+    EventEmitter.prototype.addListener = EventEmitter.prototype.on;
+    EventEmitter.prototype.off = function (n, f) { this._ev[n] = (this._ev[n] || []).filter(function (x) { return x !== f; }); return this; };
+    EventEmitter.prototype.removeListener = EventEmitter.prototype.off;
+    EventEmitter.prototype.once = function (n, f) { var self = this; function w() { self.off(n, w); f.apply(self, arguments); } return this.on(n, w); };
+    EventEmitter.prototype.emit = function (n) { var a = Array.prototype.slice.call(arguments, 1); var l = (this._ev[n] || []).slice(); for (var i = 0; i < l.length; i++) l[i].apply(this, a); return l.length > 0; };
+    EventEmitter.EventEmitter = EventEmitter;
+    return EventEmitter;
+  },
+  util: function () {
+    return {
+      inspect: __fmt,
+      format: function () { return Array.prototype.map.call(arguments, __fmt).join(' '); },
+      inherits: function (c, s) { c.prototype = Object.create(s.prototype); c.prototype.constructor = c; }
+    };
+  }
+};
+function __dirnameOf(p) { var i = p.lastIndexOf('/'); return i <= 0 ? '/' : p.slice(0, i); }
+function __norm(p) {
+  var out = [], parts = p.split('/');
+  for (var i = 0; i < parts.length; i++) {
+    var s = parts[i];
+    if (s === '' || s === '.') continue;
+    if (s === '..') out.pop(); else out.push(s);
+  }
+  return '/' + out.join('/');
+}
+function __tryFile(p) {
+  var c = [p, p + '.js', p + '.json', p + '/index.js'];
+  for (var i = 0; i < c.length; i++) { if (__isFile(c[i])) return c[i]; }
+  return null;
+}
+function __resolve(req, from) {
+  var first = req.charAt(0);
+  var base = (first === '.' || first === '/') ? __norm(first === '/' ? req : from + '/' + req) : __norm(__NM + '/' + req);
+  var r = __tryFile(base);
+  if (r) return r;
+  var pj = __readFile(base + '/package.json');
+  if (pj !== null) {
+    try {
+      var m = JSON.parse(pj).main;
+      if (m) { r = __tryFile(__norm(base + '/' + m)); if (r) return r; }
+    } catch (e) {}
+  }
+  return null;
+}
+function __makeRequire(from) {
+  return function (name) {
+    if (name.indexOf('node:') === 0) name = name.slice(5);
+    if (Object.prototype.hasOwnProperty.call(__builtins, name)) {
+      return __builtinCache[name] || (__builtinCache[name] = __builtins[name]());
+    }
+    var file = __resolve(name, from);
+    if (!file) throw new Error("Cannot find module '" + name + "'. Install it with: npm install " + name);
+    if (__modCache[file]) return __modCache[file].exports;
+    var mod = { exports: {}, id: file, filename: file };
+    __modCache[file] = mod;
+    var src = __readFile(file);
+    if (file.slice(-5) === '.json') { mod.exports = JSON.parse(src); return mod.exports; }
+    var dir = __dirnameOf(file);
+    var fn = new Function('exports', 'require', 'module', '__filename', '__dirname', src);
+    fn.call(mod.exports, mod.exports, __makeRequire(dir), mod, file, dir);
+    return mod.exports;
+  };
+}
+var require = __makeRequire("__PROJ_PATH__");
 """#
 
     private static func makeContext(term: Terminal, token: Int?) -> JSContext {
@@ -468,7 +563,20 @@ function __fire() {
             return NSNull()
         }
         ctx.setObject(ask, forKeyedSubscript: "__prompt" as NSString)
-        ctx.evaluateScript(prelude)
+        let readFile: @convention(block) (String) -> Any = { path in
+            if let text = try? String(contentsOfFile: path, encoding: .utf8) { return text }
+            return NSNull()
+        }
+        ctx.setObject(readFile, forKeyedSubscript: "__readFile" as NSString)
+        let isFile: @convention(block) (String) -> Bool = { path in
+            var isDir: ObjCBool = false
+            return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && !isDir.boolValue
+        }
+        ctx.setObject(isFile, forKeyedSubscript: "__isFile" as NSString)
+        let source = prelude
+            .replacingOccurrences(of: "__NM_PATH__", with: PackageManager.nodeModules.path)
+            .replacingOccurrences(of: "__PROJ_PATH__", with: ProjectStore.directory.path)
+        ctx.evaluateScript(source)
         return ctx
     }
 
