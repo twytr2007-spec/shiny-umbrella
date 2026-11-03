@@ -1360,7 +1360,7 @@ jobs:
 
       - name: Build
         run: |
-          xcodebuild -project CodeIDE.xcodeproj -scheme CodeIDE -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build > build.log 2>&1 || {
+          xcodebuild -project PyScripta.xcodeproj -scheme PyScripta -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build > build.log 2>&1 || {
             echo "===== ERRORS ====="
             grep -E "error:" build.log | sort -u | head -n 40
             echo "===== LAST LINES ====="
@@ -1372,7 +1372,7 @@ jobs:
       - name: Package IPA
         run: |
           set -e
-          APP=$(find build/Build/Products -maxdepth 3 -name "CodeIDE.app" | head -1)
+          APP=$(find build/Build/Products -maxdepth 3 -name "PyScripta.app" | head -1)
           test -n "$APP"
           echo "App bundle: $APP"
           SLICE=""
@@ -1428,7 +1428,7 @@ jobs:
               echo "Frameworks/$FULL.framework/$FULL" > "${SO%.so}.fwork"
               RELAPP="${SO#$APP/}"
               echo "${RELAPP%.so}.fwork" > "$FW/$FULL.origin"
-              printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>CFBundleExecutable</key><string>%s</string><key>CFBundleIdentifier</key><string>com.codeide.pymod.x%s</string><key>CFBundleInfoDictionaryVersion</key><string>6.0</string><key>CFBundleName</key><string>%s</string><key>CFBundlePackageType</key><string>FMWK</string><key>CFBundleShortVersionString</key><string>1.0</string><key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array><key>CFBundleVersion</key><string>1</string><key>MinimumOSVersion</key><string>13.0</string></dict></plist>\n' "$FULL" "${FULL//_/-}" "$FULL" > "$FW/Info.plist"
+              printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>CFBundleExecutable</key><string>%s</string><key>CFBundleIdentifier</key><string>com.pyscripta.pymod.x%s</string><key>CFBundleInfoDictionaryVersion</key><string>6.0</string><key>CFBundleName</key><string>%s</string><key>CFBundlePackageType</key><string>FMWK</string><key>CFBundleShortVersionString</key><string>1.0</string><key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array><key>CFBundleVersion</key><string>1</string><key>MinimumOSVersion</key><string>13.0</string></dict></plist>\n' "$FULL" "${FULL//_/-}" "$FULL" > "$FW/Info.plist"
               COUNT=$((COUNT+1))
             done < /tmp/so.list
             echo "Converted $COUNT extension modules in $BASE"
@@ -1455,11 +1455,11 @@ jobs:
           fi
 
           ls "$APP/Frameworks" | wc -l
-          rm -rf Payload CodeIDE.ipa
+          rm -rf Payload PyScripta.ipa
           mkdir Payload
           cp -R "$APP" Payload/
-          zip -qry CodeIDE.ipa Payload
-          ls -lh CodeIDE.ipa
+          zip -qry PyScripta.ipa Payload
+          ls -lh PyScripta.ipa
 
       - name: Upload build log on failure
         if: failure()
@@ -1472,13 +1472,13 @@ jobs:
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CodeIDE-ipa
-          path: CodeIDE.ipa
+          name: PyScripta-ipa
+          path: PyScripta.ipa
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete latest --yes --cleanup-tag || true
-          gh release create latest CodeIDE.ipa --title "Latest build" --notes "Unsigned IPA. Install it with AltStore or Sideloadly."
+          gh release create latest PyScripta.ipa --title "Latest build" --notes "Unsigned IPA. Install it with AltStore or Sideloadly."
           echo "Download: https://github.com/${{ github.repository }}/releases/tag/latest"
