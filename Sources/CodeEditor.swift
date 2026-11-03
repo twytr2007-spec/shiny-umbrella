@@ -264,6 +264,8 @@ struct CodeEditor: UIViewRepresentable {
         var layout: GutterLayoutManager?
         var lastKey = ""
         private var currentInset: CGFloat = -1
+        private var accessoryBar: UIInputView?
+        private var accessoryButtons: [UIButton] = []
 
         init(_ parent: CodeEditor) { self.parent = parent }
 
@@ -284,6 +286,17 @@ struct CodeEditor: UIViewRepresentable {
                 l.highlightColor = theme.ui(theme.text).withAlphaComponent(0.07)
             }
             currentInset = -1
+            styleAccessory()
+        }
+
+        func styleAccessory() {
+            let t = parent.theme
+            accessoryBar?.backgroundColor = t.ui(t.panel)
+            for b in accessoryButtons {
+                b.backgroundColor = t.ui(t.tabInactive)
+                b.setTitleColor(t.ui(t.text), for: .normal)
+                b.tintColor = t.ui(t.text)
+            }
         }
 
         func textViewDidChange(_ tv: UITextView) {
@@ -396,21 +409,40 @@ struct CodeEditor: UIViewRepresentable {
             let ns = string as NSString
             let full = NSRange(location: 0, length: ns.length)
 
+            func apply(_ rules: [Highlighter.Rule], _ range: NSRange) {
+                for rule in rules {
+                    rule.regex.enumerateMatches(in: string, options: [], range: range) { match, _, _ in
+                        guard let m = match else { return }
+                        let role: Theme.Role
+                        if let fixed = rule.role {
+                            role = fixed
+                        } else if let classify = rule.classify {
+                            role = classify(ns.substring(with: m.range))
+                        } else {
+                            return
+                        }
+                        storage.addAttribute(.foregroundColor, value: theme.ui(theme.hex(for: role)), range: m.range)
+                    }
+                }
+            }
+
             storage.beginEditing()
             storage.setAttributes(base, range: full)
-            for rule in Highlighter.rules(for: parent.language) {
-                rule.regex.enumerateMatches(in: string, options: [], range: full) { match, _, _ in
-                    guard let m = match else { return }
-                    let role: Theme.Role
-                    if let fixed = rule.role {
-                        role = fixed
-                    } else if let classify = rule.classify {
-                        role = classify(ns.substring(with: m.range))
-                    } else {
-                        return
-                    }
-                    storage.addAttribute(.foregroundColor, value: theme.ui(theme.hex(for: role)), range: m.range)
-                }
+            let rules = Highlighter.rules(for: parent.language)
+            apply(rules, full)
+
+            // f-strings and template literals: braces get their own color, the inside is normal code
+            let found = Highlighter.interpolations(in: ns, language: parent.language)
+            let braceColor = theme.ui(theme.hex(for: .brace))
+            let prefixColor = theme.ui(theme.hex(for: .keyword))
+            for prefix in found.prefixes {
+                storage.addAttribute(.foregroundColor, value: prefixColor, range: prefix)
+            }
+            for item in found.items {
+                storage.addAttribute(.foregroundColor, value: theme.ui(theme.text), range: item.inner)
+                apply(rules, item.inner)
+                storage.addAttribute(.foregroundColor, value: braceColor, range: item.open)
+                storage.addAttribute(.foregroundColor, value: braceColor, range: item.close)
             }
             storage.endEditing()
             tv.typingAttributes = base
@@ -440,17 +472,16 @@ struct CodeEditor: UIViewRepresentable {
             if let img = image {
                 button.setImage(UIImage(systemName: img), for: .normal)
             }
-            button.setTitleColor(.label, for: .normal)
-            button.tintColor = .label
-            button.backgroundColor = UIColor.secondarySystemFill
-            button.layer.cornerRadius = 6
+            button.layer.cornerRadius = 7
+            accessoryButtons.append(button)
             button.widthAnchor.constraint(greaterThanOrEqualToConstant: wide ? 46 : 38).isActive = true
             button.addAction(UIAction { _ in action() }, for: .touchUpInside)
             return button
         }
 
         func makeAccessory() -> UIView {
-            let bar = UIInputView(frame: CGRect(x: 0, y: 0, width: 320, height: 44), inputViewStyle: .keyboard)
+            let bar = UIInputView(frame: CGRect(x: 0, y: 0, width: 320, height: 44), inputViewStyle: .default)
+            accessoryBar = bar
             let scroll = UIScrollView()
             scroll.showsHorizontalScrollIndicator = false
             scroll.translatesAutoresizingMaskIntoConstraints = false
@@ -490,6 +521,7 @@ struct CodeEditor: UIViewRepresentable {
                 stack.addArrangedSubview(makeButton(title: key.0) { ctl.insert(key.1, back: key.2) })
             }
             stack.addArrangedSubview(makeButton(image: "keyboard.chevron.compact.down", wide: true) { ctl.dismissKeyboard() })
+            styleAccessory()
             return bar
         }
     }

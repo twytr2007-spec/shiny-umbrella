@@ -21,6 +21,7 @@ struct ContentView: View {
     @State private var showFiles = false
     @State private var showNew = false
     @State private var showSettings = false
+    @State private var keyboardVisible = false
 
     private var theme: Theme { Theme.byID(themeID) }
     private var language: Language { store.current?.language ?? .python }
@@ -73,6 +74,12 @@ struct ContentView: View {
         .preferredColorScheme(theme.isDark ? .dark : .light)
         .tint(theme.accentColor)
         .onChange(of: scenePhase) { _ in store.saveAll() }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+            keyboardVisible = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            keyboardVisible = false
+        }
         .sheet(isPresented: $showFiles) {
             FilesSheet(store: store, theme: theme)
         }
@@ -247,7 +254,12 @@ struct ContentView: View {
         .padding(.horizontal, 12)
         .frame(height: 24)
         .frame(maxWidth: .infinity)
-        .background(theme.statusColor.ignoresSafeArea(edges: .bottom))
+        .background(theme.statusColor.ignoresSafeArea(edges: statusEdges))
+    }
+
+    private var statusEdges: Edge.Set {
+        let none: Edge.Set = []
+        return keyboardVisible ? none : .bottom
     }
 
     // MARK: Actions

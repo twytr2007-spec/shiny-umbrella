@@ -10,7 +10,7 @@ extension Color {
 }
 
 struct Theme: Identifiable {
-    enum Role { case keyword, string, comment, number, builtin, function }
+    enum Role { case keyword, string, comment, number, builtin, function, brace }
 
     let id: String
     let name: String
@@ -61,6 +61,7 @@ struct Theme: Identifiable {
         case .number: return number
         case .builtin: return builtin
         case .function: return function
+        case .brace: return isDark ? 0xFFD700 : 0x0431FA
         }
     }
 
