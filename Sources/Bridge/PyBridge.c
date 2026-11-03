@@ -110,13 +110,26 @@ int ide_py_init(const char *home, const char *executable, const char *libdir,
     if (PyStatus_Exception(status)) goto fail;
     PyConfig_Clear(&config);
 
-    if (PyRun_SimpleString(bootstrap) != 0) {
-        set_err(err, errlen, "bootstrap script failed");
-        return -4;
-    }
-
     PyObject *main_mod = PyImport_AddModule("__main__");
     PyObject *dict = main_mod ? PyModule_GetDict(main_mod) : NULL;
+    PyObject *res = dict ? PyRun_String(bootstrap, Py_file_input, dict, dict) : NULL;
+    if (!res) {
+        char buf[600];
+        const char *tname = "error";
+        const char *msg = NULL;
+        PyObject *t = NULL, *v = NULL, *tb = NULL, *str = NULL;
+        PyErr_Fetch(&t, &v, &tb);
+        PyErr_NormalizeException(&t, &v, &tb);
+        if (t) tname = ((PyTypeObject *)t)->tp_name;
+        if (v) str = PyObject_Str(v);
+        if (str) msg = PyUnicode_AsUTF8(str);
+        snprintf(buf, sizeof(buf), "bootstrap script failed: %s: %s", tname, msg ? msg : "(no message)");
+        set_err(err, errlen, buf);
+        PyErr_Clear();
+        return -4;
+    }
+    Py_DECREF(res);
+
     g_run_fn = dict ? PyDict_GetItemString(dict, "_ide_run") : NULL;
     g_repl_fn = dict ? PyDict_GetItemString(dict, "_ide_repl") : NULL;
     if (!g_run_fn || !g_repl_fn) {

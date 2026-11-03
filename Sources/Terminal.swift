@@ -260,7 +260,7 @@ final class PythonEngine {
         let exe = Bundle.main.executablePath ?? (bundle + "/CodeIDE")
         var errBuf = [CChar](repeating: 0, count: 1024)
         let cap = Int32(errBuf.count)
-        let rc = ide_py_init(bundle + "/python", exe, libdir, PythonEngine.bootstrap(),
+        let rc = ide_py_init(bundle + "/python", exe, libdir, PythonEngine.bootstrap(stdlib: libdir),
                              pyOutCallback, pyInCallback, &errBuf, cap)
         if rc != 0 {
             failure = "Python failed to start (code \(rc)): " + String(cString: errBuf)
@@ -274,7 +274,7 @@ final class PythonEngine {
     func repl(_ line: String) { ide_py_repl(line) }
     func interrupt() { ide_py_interrupt() }
 
-    static func bootstrap() -> String {
+    static func bootstrap(stdlib: String) -> String {
         let projects = ProjectStore.directory.path
         let site = PackageManager.sitePackages.path
         return #"""
@@ -290,7 +290,7 @@ except Exception:
 if PROJECTS not in sys.path:
     sys.path.insert(0, PROJECTS)
 SITE = r"\#(site)"
-for _p in (SITE, os.path.join(os.path.dirname(os.__file__), "site-packages")):
+for _p in (SITE, os.path.join(r"\#(stdlib)", "site-packages")):
     if _p not in sys.path:
         sys.path.append(_p)
 
